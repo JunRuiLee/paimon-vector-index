@@ -1433,10 +1433,8 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             )));
         }
 
-        let (mut pq, row_ids, pq_codes, adjacency_index) =
+        let (pq, row_ids, pq_codes, adjacency_index) =
             read_resident_sections(&mut self.reader, &self.header)?;
-        pq.try_rebuild_norms_cache()
-            .map_err(|_| invalid_data("DiskANN PQ norms allocation failed"))?;
         validate_pq_code_padding(&self.header, &pq_codes)?;
         let adjacency_validation =
             AdjacencyValidationCache::new(adjacency_page_count(&self.header)?)?;
@@ -2312,8 +2310,8 @@ pub fn write_diskann_index_with_stats(
         index.d,
         index.ids.len(),
         prepared.graph.entry_node,
-        index.pq.m,
-        index.pq.nbits,
+        index.pq.m(),
+        index.pq.nbits(),
         index.metric,
         index.build_params,
         row_ids_len,
@@ -2588,38 +2586,38 @@ fn write_pq_codebook(
     put_u32(
         &mut header,
         8,
-        u32::try_from(pq.d).map_err(|_| invalid_input("DiskANN PQ dimension exceeds u32"))?,
+        u32::try_from(pq.d()).map_err(|_| invalid_input("DiskANN PQ dimension exceeds u32"))?,
     );
     put_u32(
         &mut header,
         12,
-        u32::try_from(pq.m).map_err(|_| invalid_input("DiskANN PQ m exceeds u32"))?,
+        u32::try_from(pq.m()).map_err(|_| invalid_input("DiskANN PQ m exceeds u32"))?,
     );
     put_u32(
         &mut header,
         16,
-        u32::try_from(pq.nbits).map_err(|_| invalid_input("DiskANN PQ bits exceeds u32"))?,
+        u32::try_from(pq.nbits()).map_err(|_| invalid_input("DiskANN PQ bits exceeds u32"))?,
     );
     put_u32(
         &mut header,
         20,
-        u32::try_from(pq.ksub).map_err(|_| invalid_input("DiskANN PQ ksub exceeds u32"))?,
+        u32::try_from(pq.ksub()).map_err(|_| invalid_input("DiskANN PQ ksub exceeds u32"))?,
     );
     put_u32(
         &mut header,
         24,
-        u32::try_from(pq.chunk_offsets.len())
+        u32::try_from(pq.chunk_offsets().len())
             .map_err(|_| invalid_input("DiskANN PQ chunk-offset count exceeds u32"))?,
     );
     writer.write_bytes(&header)?;
-    for &offset in &pq.chunk_offsets {
+    for &offset in pq.chunk_offsets() {
         writer.write_bytes(
             &u32::try_from(offset)
                 .map_err(|_| invalid_input("DiskANN PQ chunk offset exceeds u32"))?
                 .to_le_bytes(),
         )?;
     }
-    for &value in &pq.centroids {
+    for &value in pq.centroids() {
         writer.write_bytes(&value.to_le_bytes())?;
     }
     Ok(())
@@ -3050,7 +3048,7 @@ fn decode_pq_codebook(bytes: &[u8], header: &DiskAnnHeader) -> io::Result<Produc
     .map_err(invalid_data)?;
     let mut centroids = Vec::new();
     centroids
-        .try_reserve_exact(header.dimension as usize * pq.ksub)
+        .try_reserve_exact(header.dimension as usize * pq.ksub())
         .map_err(|_| invalid_data("DiskANN PQ centroid allocation failed"))?;
     for encoded in bytes[centroids_offset..].chunks_exact(4) {
         let value =
@@ -3060,7 +3058,8 @@ fn decode_pq_codebook(bytes: &[u8], header: &DiskAnnHeader) -> io::Result<Produc
         }
         centroids.push(value);
     }
-    pq.centroids = centroids;
+    pq.try_set_centroids(centroids)
+        .map_err(|_| invalid_data("DiskANN PQ norms allocation failed"))?;
     if !pq.has_valid_layout() {
         return Err(invalid_data("invalid DiskANN PQ codebook layout"));
     }
@@ -4120,15 +4119,18 @@ mod tests {
                     ..DiskAnnBuildParams::default()
                 },
             );
-            index.pq.centroids = (0..256).map(|code| code as f32).collect();
-            index.pq.rebuild_norms_cache();
+            index
+                .pq
+                .set_centroids((0..256).map(|code| code as f32).collect());
             index.ids = vec![7];
             index.vectors = vec![0.0];
             index
         }
 
         let mut invalid_codebook = one_vector_index();
-        invalid_codebook.pq.centroids[0] = f32::NAN;
+        let mut centroids = invalid_codebook.pq.centroids().to_vec();
+        centroids[0] = f32::NAN;
+        invalid_codebook.pq.set_centroids(centroids);
         let mut codebook_output = Vec::new();
         assert!(
             write_diskann_index(&invalid_codebook, &mut PosWriter::new(&mut codebook_output))
@@ -4154,7 +4156,7 @@ mod tests {
         assert!(f16_output.is_empty());
 
         let mut invalid_pq_shape = one_vector_index();
-        invalid_pq_shape.pq.chunk_offsets[1] = 0;
+        invalid_pq_shape.pq = ProductQuantizer::new(invalid_pq_shape.d + 1, 1);
         let mut pq_shape_output = Vec::new();
         assert!(
             write_diskann_index(&invalid_pq_shape, &mut PosWriter::new(&mut pq_shape_output))
@@ -4840,7 +4842,7 @@ mod tests {
         );
         assert_eq!(reader.row_id_count().unwrap(), indexed_count);
         assert_eq!(reader.pq_codes().unwrap().len(), indexed_count * 2);
-        assert_eq!(reader.pq().unwrap().centroids, index.pq.centroids);
+        assert_eq!(reader.pq().unwrap().centroids(), index.pq.centroids());
 
         let limited_rounds = Arc::new(Mutex::new(Vec::new()));
         let limited_recording = RoundRecordingReader {

@@ -317,8 +317,8 @@ impl DiskAnnIndex {
     fn training_plan(&self, n: usize) -> io::Result<PqTrainingPlan> {
         pq_training_plan_with_sample_buffers(
             self.d,
-            self.pq.m,
-            self.pq.ksub,
+            self.pq.m(),
+            self.pq.ksub(),
             n,
             self.build_params.memory_budget_bytes,
             usize::from(self.metric == MetricType::Cosine) + 1,
@@ -338,14 +338,15 @@ impl DiskAnnIndex {
         let row_ids = checked_bytes(n, size_of::<i64>(), "row IDs")?;
         let row_id_encoding_scratch = row_id_encoding_scratch_bytes(n)?;
         let pq_codes = checked_bytes(n, self.pq.code_size(), "PQ codes")?;
-        let pq_codebook = checked_bytes(self.pq.centroids.len(), size_of::<f32>(), "PQ codebook")?;
+        let pq_codebook =
+            checked_bytes(self.pq.centroids().len(), size_of::<f32>(), "PQ codebook")?;
         let pq_build_distances = if self.build_params.build_distance
             == DiskAnnBuildDistance::ProductQuantized
         {
             self.pq
-                .m
-                .checked_mul(self.pq.ksub)
-                .and_then(|value| value.checked_mul(self.pq.ksub))
+                .m()
+                .checked_mul(self.pq.ksub())
+                .and_then(|value| value.checked_mul(self.pq.ksub()))
                 .and_then(|value| value.checked_mul(size_of::<f32>()))
                 .ok_or_else(|| invalid_input("DiskANN PQ build-distance table size overflows"))?
         } else {
@@ -438,12 +439,17 @@ impl DiskAnnIndex {
     }
 
     pub(crate) fn validate_for_write(&self) -> io::Result<()> {
-        validate_diskann_format_configuration(self.d, self.pq.m, self.pq.nbits, self.build_params)?;
+        validate_diskann_format_configuration(
+            self.d,
+            self.pq.m(),
+            self.pq.nbits(),
+            self.build_params,
+        )?;
         validate_diskann_training_budget(
             self.d,
             self.metric,
-            self.pq.m,
-            self.pq.nbits,
+            self.pq.m(),
+            self.pq.nbits(),
             self.build_params.memory_budget_bytes,
         )?;
         if self.build_params.memory_budget_bytes == 0 {
@@ -489,22 +495,22 @@ impl DiskAnnIndex {
         }
 
         let expected_ksub = 1usize
-            .checked_shl(self.pq.nbits as u32)
+            .checked_shl(self.pq.nbits() as u32)
             .ok_or_else(|| invalid_input("DiskANN PQ centroid count overflows usize"))?;
         let expected_centroids = self
             .d
             .checked_mul(expected_ksub)
             .ok_or_else(|| invalid_input("DiskANN PQ codebook shape overflows usize"))?;
-        if self.pq.d != self.d
-            || self.pq.ksub != expected_ksub
-            || self.pq.centroids.len() != expected_centroids
+        if self.pq.d() != self.d
+            || self.pq.ksub() != expected_ksub
+            || self.pq.centroids().len() != expected_centroids
             || !self.pq.has_valid_layout()
         {
             return Err(invalid_input("DiskANN PQ codebook shape is invalid"));
         }
         if let Some(offset) = self
             .pq
-            .centroids
+            .centroids()
             .iter()
             .position(|value| !value.is_finite())
         {
