@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::collect::{Collector, RangeCollector};
 use crate::distance::{
     fvec_l2sqr, fvec_l2sqr_scaled_exceeds, fvec_normalize, MetricType, QueryDistance,
 };
+use crate::index::validate_queries;
 use crate::index_io_util::{
     bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, ivf_payload_is_oversized,
     pread_batched_slices, read_delta_varint_ids_at, validate_reserved_zero,
@@ -26,10 +28,12 @@ use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
+use crate::range::{RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams};
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::io;
 use std::mem::{align_of, size_of};
+use std::sync::Mutex;
 
 pub const IVFFLAT_MAGIC: u32 = 0x4956464C; // "IVFL"
 pub const IVFFLAT_VERSION: u32 = 1;
@@ -607,7 +611,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
     fn for_each_streamed_list_chunk(
         &mut self,
         list_id: usize,
-        mut consume: impl FnMut(&[i64], &[f32]),
+        mut consume: impl FnMut(&[i64], &[f32]) -> io::Result<()>,
     ) -> io::Result<()> {
         self.ensure_loaded()?;
         let count = self.list_counts[list_id] as usize;
@@ -656,7 +660,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 .pread(&mut [ReadRequest::new(chunk_offset, payload.read_buf_mut())])?;
             payload.prepare_vectors()?;
             let row_end = row_start + chunk_rows;
-            consume(&ids[row_start..row_end], payload.vectors());
+            consume(&ids[row_start..row_end], payload.vectors())?;
             row_start = row_end;
         }
         Ok(())
@@ -717,7 +721,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 let metric = self.metric;
                 let d = self.d;
                 self.for_each_streamed_list_chunk(first_list, |ids, vectors| {
-                    scan_flat_rows(&q, ids, vectors, d, metric, filter, &mut heap);
+                    scan_flat_rows(&q, ids, vectors, d, metric, filter, &mut heap)
                 })?;
                 batch_start += 1;
                 continue;
@@ -735,16 +739,16 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                     .par_iter()
                     .map(|list| {
                         let mut local_heap = ReaderTopKHeap::new(k);
-                        scan_flat_list(&q, list, self.d, self.metric, filter, &mut local_heap);
-                        local_heap.into_sorted()
+                        scan_flat_list(&q, list, self.d, self.metric, filter, &mut local_heap)?;
+                        Ok(local_heap.into_sorted())
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<io::Result<Vec<_>>>()?;
                 for results in per_list_results {
                     merge_flat_results(&mut heap, results);
                 }
             } else {
                 for list in &lists {
-                    scan_flat_list(&q, list, self.d, self.metric, filter, &mut heap);
+                    scan_flat_list(&q, list, self.d, self.metric, filter, &mut heap)?;
                 }
             }
             batch_start = batch_end;
@@ -762,6 +766,282 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         let filter = decode_roaring_filter(roaring_filter_bytes)?;
         self.search_with_filter(query, k, nprobe, Some(&filter))
+    }
+
+    /// Distance range search: returns every member of the **probed lists** whose
+    /// distance falls in `[lower, upper)`.
+    ///
+    /// "No cap" is a promise about **not truncating**, not about
+    /// **completeness**: how many in-band rows come back depends on how much the
+    /// IVF probe covered, and a smaller `nprobe` returns fewer.
+    ///
+    /// How the contract differs from [`search`]: there is **no limit and no
+    /// cap**, aligned with Faiss's `range_search`. Ordering is the caller's
+    /// business
+    /// (it is SQL's job), so results are neither padded nor sorted.
+    ///
+    /// [`search`]: IVFFlatIndexReader::search
+    pub fn range_search(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_with_filter(query, params, None)
+    }
+
+    pub fn range_search_with_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_batch_with_filter(query, 1, params, filter)
+    }
+
+    /// Range search restricted to the ids in a serialized Roaring allow-list.
+    ///
+    /// The filter is decoded **before** the empty-band shortcut, so a malformed
+    /// filter is still rejected. Unlike the top-K Roaring path there is no
+    /// filter-cardinality probe: the only consumer of that count is the automatic
+    /// width mode, which range search does not support yet.
+    pub fn range_search_with_roaring_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        self.range_search_with_filter(query, params, Some(&filter))
+    }
+
+    /// Batched range search. A unique probed list is still read once and fanned
+    /// out to every query that selected it.
+    pub fn range_search_batch(
+        &mut self,
+        queries: &[f32],
+        nq: usize,
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_batch_with_filter(queries, nq, params, None)
+    }
+
+    pub fn range_search_batch_with_roaring_filter(
+        &mut self,
+        queries: &[f32],
+        nq: usize,
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        // As in the single-query case: decode first, so a malformed filter is
+        // rejected even under an empty band.
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        self.range_search_batch_with_filter(queries, nq, params, Some(&filter))
+    }
+
+    /// The batch range engine. The single-query entry point is its `nq = 1`
+    /// wrapper, so both share one scheduling and accounting path.
+    ///
+    /// Going per-list with `read_inverted_lists(&[one])` would degenerate into
+    /// one I/O per list, whereas the top-K single-query path already batches
+    /// reads and then chooses a parallel or serial arm; sharing the batch engine
+    /// keeps that behaviour and means the statistics are wired up in exactly one
+    /// place.
+    pub fn range_search_batch_with_filter(
+        &mut self,
+        queries: &[f32],
+        nq: usize,
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+    ) -> io::Result<RangeSearchResult> {
+        // This reader method is public and can be called directly, so the
+        // enum layer's validation cannot be relied upon here.
+        validate_queries(queries, nq, self.d)?;
+        // The band's metric must match the index's, otherwise the scan would
+        // compute values under the index's metric while deciding membership with
+        // another metric's band, silently returning wrong rows.
+        if params.band().metric() != self.metric {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "band metric {:?} does not match index metric {:?}",
+                    params.band().metric(),
+                    self.metric
+                ),
+            ));
+        }
+        let nprobe = params.validate(self.nlist)?;
+        let mut builder = RangeResultBuilder::new(nq);
+        // Only once all of the above has passed may an empty band short-circuit;
+        // doing it earlier would let an empty band mask a wrong dimension, a
+        // non-finite query or a metric mismatch. The index is not touched here,
+        // so no list is read.
+        if params.band().is_empty() {
+            return Ok(builder.build());
+        }
+        // Cold start: a freshly opened reader has an empty centroid table and
+        // `loaded == false`. The top-K path calls ensure_loaded() first thing;
+        // omitting it here would panic when the coarse quantizer reads the empty
+        // centroid array.
+        self.ensure_loaded()?;
+
+        // Note for metric certification: unlike the top-K path this does not
+        // apply `fvec_normalize` for cosine. That is currently unreachable,
+        // because `params.validate` rejects every non-L2 metric above, but
+        // whoever certifies cosine must add the normalization here as well as
+        // relaxing `ensure_certified_metric`.
+        //
+        // Ranked probe selection, one group per query.
+        //
+        // This relies on `find_topk_batch` selecting the same centroids for a
+        // query whether it runs alone or in a batch: range search promises a
+        // query returns the same rows either way, and the probed lists decide
+        // which rows are reachable at all. The helper takes an SGEMM path for
+        // `nq > 1` and the direct kernel for `nq == 1`, but recomputes the
+        // distance of every selected centroid with the direct kernel wherever
+        // its error bound leaves the ranking ambiguous, which is what makes the
+        // two agree. `kmeans` pins that property with a test; if it is ever
+        // relaxed, this caller needs an exact helper of its own again.
+        let (probe_lists, _coarse_distances) = kmeans::find_topk_batch(
+            queries,
+            nq,
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+            nprobe,
+        );
+        for (qi, lists) in probe_lists.iter().enumerate() {
+            builder.record_lists_probed(qi, lists.len());
+        }
+        // The list-to-query fan-out table, which preserves "a unique list is
+        // read once". The inner vectors hold *query* indices in ascending query
+        // order, not probe ranks -- a query's own rank is its position within
+        // `probe_lists[qi]`. Scheduling that has to act on rank order is the
+        // later caps work's concern, and it will need to replace this loop.
+        let mut list_to_queries: Vec<Vec<usize>> = vec![Vec::new(); self.nlist];
+        let mut unique_lists: Vec<usize> = Vec::new();
+        for (qi, lists) in probe_lists.iter().enumerate() {
+            for &list_id in lists {
+                if list_to_queries[list_id].is_empty() {
+                    unique_lists.push(list_id);
+                }
+                list_to_queries[list_id].push(qi);
+            }
+        }
+
+        // Per-query output buckets. The whole batch of (list, query) results is
+        // deliberately **not** materialized and merged afterwards: unlike a
+        // top-K local heap, a range collector has no upper bound, so that shape
+        // would hold O(B x Q x hits) resident at once. Each (list, query) task
+        // holds only that list's hits and takes the lock once to merge them.
+        let outputs: Vec<Mutex<Vec<(i64, f32)>>> =
+            (0..nq).map(|_| Mutex::new(Vec::new())).collect();
+        let tallies: Vec<Mutex<(usize, usize)>> = // (scanned, early_abandoned)
+            (0..nq).map(|_| Mutex::new((0, 0))).collect();
+
+        let mut batch_start = 0usize;
+        while batch_start < unique_lists.len() {
+            let first_list = unique_lists[batch_start];
+            // An oversized list must go through streaming; bypassing it would
+            // load the whole list at once and break the existing input-memory
+            // bound.
+            if ivf_payload_is_oversized(self.list_payload_len(first_list)?) {
+                let query_indices = &list_to_queries[first_list];
+                let (metric, d) = (self.metric, self.d);
+                let band = params.band();
+                self.record_list_read_for(&mut builder, first_list);
+                self.for_each_streamed_list_chunk(first_list, |ids, vectors| {
+                    for &qi in query_indices {
+                        let q = &queries[qi * d..(qi + 1) * d];
+                        let mut collector = RangeCollector::new(band, d);
+                        scan_flat_rows(q, ids, vectors, d, metric, filter, &mut collector)?;
+                        let mut tally = tallies[qi].lock().expect("tally lock");
+                        tally.0 += collector.scanned();
+                        tally.1 += collector.early_abandoned();
+                        outputs[qi]
+                            .lock()
+                            .expect("output lock")
+                            .extend(collector.into_rows());
+                    }
+                    Ok(())
+                })?;
+                batch_start += 1;
+                continue;
+            }
+            let count = self.batch_read_end(&unique_lists[batch_start..])?.max(1);
+            let batch_end = (batch_start + count).min(unique_lists.len());
+            let loaded_lists = self.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
+            for list in &loaded_lists {
+                self.record_list_read_for(&mut builder, list.list_id);
+            }
+            let scan_components = loaded_lists
+                .iter()
+                .map(|list| {
+                    list.ids
+                        .len()
+                        .saturating_mul(list_to_queries[list.list_id].len())
+                })
+                .sum::<usize>()
+                .saturating_mul(self.d);
+            let (metric, d) = (self.metric, self.d);
+            let band = params.band();
+            let scan_one = |list: &FlatListData, qi: usize| -> io::Result<()> {
+                let q = &queries[qi * d..(qi + 1) * d];
+                let mut collector = RangeCollector::new(band, d);
+                scan_flat_list(q, list, d, metric, filter, &mut collector)?;
+                let mut tally = tallies[qi].lock().expect("tally lock");
+                tally.0 += collector.scanned();
+                tally.1 += collector.early_abandoned();
+                outputs[qi]
+                    .lock()
+                    .expect("output lock")
+                    .extend(collector.into_rows());
+                Ok(())
+            };
+            // The parallel threshold is identical to the top-K path's.
+            if loaded_lists.len() > 1 && scan_components >= PARALLEL_FLAT_SCAN_MIN_COMPONENTS {
+                loaded_lists.par_iter().try_for_each(|list| {
+                    for &qi in &list_to_queries[list.list_id] {
+                        scan_one(list, qi)?;
+                    }
+                    Ok::<(), io::Error>(())
+                })?;
+            } else {
+                for list in &loaded_lists {
+                    for &qi in &list_to_queries[list.list_id] {
+                        scan_one(list, qi)?;
+                    }
+                }
+            }
+            batch_start = batch_end;
+        }
+
+        // Wrap up by **handing over** rather than copying row by row. `drain`
+        // would keep the source Vec's capacity alive, so the output bucket, the
+        // builder's rows and the final CSR would all be resident at once;
+        // `mem::take` gives the Vec's ownership to the builder, leaving the peak
+        // only one final CSR larger.
+        for qi in 0..nq {
+            let (scanned, abandoned) = *tallies[qi].lock().expect("tally lock");
+            builder.record_scanned(qi, scanned);
+            builder.record_early_abandoned(qi, abandoned);
+            let rows = std::mem::take(&mut *outputs[qi].lock().expect("output lock"));
+            builder.take_rows(qi, rows);
+        }
+        Ok(builder.build())
+    }
+
+    /// Counts a read only when the list is actually non-empty, i.e. when it will
+    /// issue payload I/O.
+    ///
+    /// The existing reader issues no payload read for an empty list, so counting
+    /// one would make `list_reads` unable to explain the real I/O cost.
+    /// `unique_lists` is already de-duplicated, and an oversized list's several
+    /// chunks are counted once on entering that branch, so any given list is
+    /// counted exactly once.
+    fn record_list_read_for(&self, builder: &mut RangeResultBuilder, list_id: usize) {
+        if self.list_counts[list_id] > 0 {
+            builder.record_list_read();
+        }
     }
 }
 
@@ -875,8 +1155,9 @@ pub(crate) fn search_batch_ivfflat_reader_filter_range<R: SeekRead>(
             reader.for_each_streamed_list_chunk(first_list, |ids, vectors| {
                 for &qi in query_indices {
                     let query = &processed[qi * d..(qi + 1) * d];
-                    scan_flat_rows(query, ids, vectors, d, metric, filter, &mut heaps[qi]);
+                    scan_flat_rows(query, ids, vectors, d, metric, filter, &mut heaps[qi])?;
                 }
+                Ok(())
             })?;
             batch_start += 1;
             continue;
@@ -903,12 +1184,12 @@ pub(crate) fn search_batch_ivfflat_reader_filter_range<R: SeekRead>(
                         .map(|&qi| {
                             let query = &processed[qi * d..(qi + 1) * d];
                             let mut local_heap = ReaderTopKHeap::new(k);
-                            scan_flat_list(query, list, d, reader.metric, filter, &mut local_heap);
-                            (qi, local_heap.into_sorted())
+                            scan_flat_list(query, list, d, reader.metric, filter, &mut local_heap)?;
+                            Ok((qi, local_heap.into_sorted()))
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<io::Result<Vec<_>>>()
                 })
-                .collect::<Vec<_>>();
+                .collect::<io::Result<Vec<_>>>()?;
             for list_results in per_list_results {
                 for (qi, results) in list_results {
                     merge_flat_results(&mut heaps[qi], results);
@@ -919,7 +1200,7 @@ pub(crate) fn search_batch_ivfflat_reader_filter_range<R: SeekRead>(
                 let list_id = list.list_id;
                 for &qi in &list_to_queries[list_id] {
                     let query = &processed[qi * d..(qi + 1) * d];
-                    scan_flat_list(query, list, d, reader.metric, filter, &mut heaps[qi]);
+                    scan_flat_list(query, list, d, reader.metric, filter, &mut heaps[qi])?;
                 }
             }
         }
@@ -1028,26 +1309,34 @@ fn seed_flat_heaps(
     }
 }
 
-fn scan_flat_list(
+fn scan_flat_list<C: Collector>(
     query: &[f32],
     list: &FlatListData,
     d: usize,
     metric: MetricType,
     filter: Option<&dyn RowIdFilter>,
-    heap: &mut ReaderTopKHeap,
-) {
-    scan_flat_rows(query, &list.ids, list.vectors(), d, metric, filter, heap);
+    collector: &mut C,
+) -> io::Result<()> {
+    scan_flat_rows(
+        query,
+        &list.ids,
+        list.vectors(),
+        d,
+        metric,
+        filter,
+        collector,
+    )
 }
 
-fn scan_flat_rows(
+fn scan_flat_rows<C: Collector>(
     query: &[f32],
     ids: &[i64],
     vectors: &[f32],
     d: usize,
     metric: MetricType,
     filter: Option<&dyn RowIdFilter>,
-    heap: &mut ReaderTopKHeap,
-) {
+    collector: &mut C,
+) -> io::Result<()> {
     // In cosine mode this caches the query norm once per list instead of
     // recomputing it for every candidate vector.
     let distance_context = QueryDistance::new(query, metric);
@@ -1057,17 +1346,20 @@ fn scan_flat_rows(
         }
         let vector = &vectors[local_idx * d..(local_idx + 1) * d];
         let distance = if metric == MetricType::L2 {
-            if let Some(threshold) = heap.worst_distance() {
-                if fvec_l2sqr_scaled_exceeds(query, vector, 1.0, threshold) {
-                    continue;
-                }
+            let threshold = collector.cutoff();
+            // An infinite cutoff can never abandon a row, so entering the
+            // kernel would only cost a wasted SIMD pass over it.
+            if threshold.is_finite() && fvec_l2sqr_scaled_exceeds(query, vector, 1.0, threshold) {
+                collector.note_abandoned();
+                continue;
             }
             fvec_l2sqr(query, vector)
         } else {
             distance_context.distance_to(vector, None)
         };
-        heap.push(distance, id);
+        collector.push(id, distance)?;
     }
+    Ok(())
 }
 
 fn merge_flat_results(heap: &mut ReaderTopKHeap, results: Vec<(f32, i64)>) {
@@ -1141,6 +1433,22 @@ impl ReaderTopKHeap {
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
         self.data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         self.data
+    }
+}
+
+impl crate::collect::Collector for ReaderTopKHeap {
+    #[inline]
+    fn cutoff(&self) -> f32 {
+        // Unlike topk::TopKHeap this heap has no seeded upper bound, so while it
+        // is not full there is no threshold to prune with, which is equivalent
+        // to no pruning at all.
+        self.worst_distance().unwrap_or(f32::INFINITY)
+    }
+
+    #[inline]
+    fn push(&mut self, id: i64, value: f32) -> io::Result<()> {
+        ReaderTopKHeap::push(self, value, id);
+        Ok(())
     }
 }
 
@@ -1544,6 +1852,7 @@ mod tests {
             .for_each_streamed_list_chunk(0, |ids, vectors| {
                 actual_ids.extend_from_slice(ids);
                 actual_vectors.extend_from_slice(vectors);
+                Ok(())
             })
             .unwrap();
         assert_eq!(actual_ids, expected.0);

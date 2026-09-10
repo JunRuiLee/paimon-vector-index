@@ -27,6 +27,7 @@ use crate::diskann::{
 use crate::diskann_io::{write_diskann_index, DiskAnnIndexReader, DISKANN_MAGIC};
 pub use crate::diskann_search::DiskAnnSearchStats;
 use crate::distance::MetricType;
+use crate::index_io_util::decode_roaring_filter;
 use crate::io::{write_index, IVFPQIndexReader, ReadRequest, SeekRead, SeekWrite, MAGIC};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfflat_io::{
@@ -51,6 +52,7 @@ use crate::ivfsq_io::{
     write_ivfsq_index, IVFSQIndexReader, IVF_SQ_MAGIC,
 };
 use crate::kmeans::KMeansConfig;
+use crate::range::{RangeSearchResult, VectorRangeSearchParams};
 pub use crate::read_options::{DeploymentProfile, VectorIndexReadPlan, VectorIndexReaderOptions};
 use crate::rq::{is_supported_rq_bits, padded_dimension, DEFAULT_RQ_BITS};
 use rand::rngs::StdRng;
@@ -1838,6 +1840,117 @@ impl<R: SeekRead> VectorIndexReader<R> {
         }
     }
 
+    /// Everything that is a caller bug regardless of which family the file
+    /// holds, checked **before** the family capability match.
+    ///
+    /// Without this a family that cannot serve range search would report
+    /// `Unsupported` for an invalid width or a mismatched metric, and a caller
+    /// treating `Unsupported` as "fall back to a scan" would silently paper over
+    /// its own bug. The IVF-Flat reader repeats the metric check because it is a
+    /// public entry point in its own right; the comparison is two enum reads, so
+    /// the duplication costs nothing measurable.
+    fn validate_range_request(&self, params: &VectorRangeSearchParams) -> io::Result<()> {
+        let metadata = self.metadata();
+        params.validate_shape(metadata.nlist)?;
+        let index_metric = metadata.metric;
+        if params.band().metric() != index_metric {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "band metric {:?} does not match index metric {index_metric:?}",
+                    params.band().metric()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Distance range search. For the contract see
+    /// [`IVFFlatIndexReader::range_search`].
+    ///
+    /// The empty-band short-circuit lives **inside each family's reader**, so a
+    /// family that cannot do range search at all still fails loud for every
+    /// band, the empty one included.
+    pub fn range_search(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        validate_query(query, self.dimension())?;
+        self.validate_range_request(&params)?;
+        match self {
+            Self::IvfFlat(reader) => reader.range_search(query, params),
+            Self::IvfRq(_) => Err(range_unsupported("ivf_rq")),
+            Self::IvfSq(_) => Err(range_unsupported("ivf_sq")),
+            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::DiskAnn(_) => Err(range_unsupported("diskann")),
+        }
+    }
+
+    /// Range search restricted to a serialized Roaring allow-list. For the
+    /// contract see [`IVFFlatIndexReader::range_search_with_roaring_filter`].
+    pub fn range_search_with_roaring_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        validate_query(query, self.dimension())?;
+        self.validate_range_request(&params)?;
+        // Decoded exactly once, here: a malformed filter is a caller bug on every
+        // family, including the ones that cannot serve range search, and the
+        // decoded value is handed to the reader so the bitmap is not parsed twice.
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        match self {
+            Self::IvfFlat(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
+            Self::IvfRq(_) => Err(range_unsupported("ivf_rq")),
+            Self::IvfSq(_) => Err(range_unsupported("ivf_sq")),
+            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::DiskAnn(_) => Err(range_unsupported("diskann")),
+        }
+    }
+
+    /// Batched distance range search. For the contract see
+    /// [`IVFFlatIndexReader::range_search`].
+    pub fn range_search_batch(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        validate_queries(queries, query_count, self.dimension())?;
+        self.validate_range_request(&params)?;
+        match self {
+            Self::IvfFlat(reader) => reader.range_search_batch(queries, query_count, params),
+            Self::IvfRq(_) => Err(range_unsupported("ivf_rq")),
+            Self::IvfSq(_) => Err(range_unsupported("ivf_sq")),
+            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::DiskAnn(_) => Err(range_unsupported("diskann")),
+        }
+    }
+
+    /// Batched range search restricted to a serialized Roaring allow-list.
+    pub fn range_search_batch_with_roaring_filter(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        validate_queries(queries, query_count, self.dimension())?;
+        self.validate_range_request(&params)?;
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        match self {
+            Self::IvfFlat(reader) => {
+                reader.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
+            }
+            Self::IvfRq(_) => Err(range_unsupported("ivf_rq")),
+            Self::IvfSq(_) => Err(range_unsupported("ivf_sq")),
+            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::DiskAnn(_) => Err(range_unsupported("diskann")),
+        }
+    }
+
     pub fn search_with_roaring_filter(
         &mut self,
         query: &[f32],
@@ -2556,7 +2669,23 @@ fn validate_query(query: &[f32], dimension: usize) -> io::Result<()> {
     validate_finite_values(query, dimension, "query")
 }
 
-fn validate_queries(queries: &[f32], query_count: usize, dimension: usize) -> io::Result<()> {
+/// Only IVF-Flat implements range search so far. The other families return
+/// `Unsupported`, meaning "we cannot serve this request, please fall back",
+/// rather than "the call has a bug". For DiskANN the reason is a lasting one:
+/// graph traversal is inherently k-oriented and has no natural radius
+/// termination criterion.
+fn range_unsupported(index_type: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("range search is not supported for index type {index_type}"),
+    )
+}
+
+pub(crate) fn validate_queries(
+    queries: &[f32],
+    query_count: usize,
+    dimension: usize,
+) -> io::Result<()> {
     validate_positive(query_count, "query count")?;
     let expected_len = query_count.checked_mul(dimension).ok_or_else(|| {
         io::Error::new(

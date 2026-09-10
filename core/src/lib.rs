@@ -21,6 +21,7 @@
 pub mod autotune;
 pub mod blas;
 pub(crate) mod coarse;
+pub(crate) mod collect;
 pub mod diskann;
 pub mod diskann_io;
 pub(crate) mod diskann_search;
@@ -40,6 +41,7 @@ pub mod kmeans;
 pub mod logging;
 pub mod opq;
 pub mod pq;
+pub mod range;
 pub mod read_options;
 pub mod rq;
 pub mod shuffler;

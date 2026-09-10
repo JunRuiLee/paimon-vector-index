@@ -26,6 +26,7 @@
         <a href="index.html" aria-current="page">Overview</a>
         <a href="api.html">API</a>
         <a href="development.html">Development</a>
+        <a href="range-search.html">Range search</a>
         <a href="ivf-flat.html">IVF-FLAT</a>
         <a href="ivf-pq.html">IVF-PQ</a>
         <a href="ivf-rq.html">IVF-RQ</a>
@@ -85,6 +86,7 @@
         <div class="card-grid">
           <article class="card"><h3>API and language bindings</h3><p>The Trainer / Writer / Reader lifecycle with complete Rust, C, C++, Java/JNI, and Python examples.</p><a class="card-link" href="api.html">Open the API guide →</a></article>
           <article class="card"><h3>Search and filtering</h3><p>Understand automatic width, explicit IVF <code>nprobe</code>, DiskANN <code>l_search</code> calibration, warm-up, and Roaring64 filters.</p><a class="card-link" href="api.html#params">Explore the search API →</a></article>
+          <article class="card"><h3>Distance range search</h3><p>Return every probed row inside a half-open band instead of a fixed <em>k</em>: the semantic contract, squared-L2 units, deriving cuts from SQL endpoints, and which combinations fail loud.</p><a class="card-link" href="range-search.html">Open the range search guide →</a></article>
           <article class="card"><h3>Development and benchmarks</h3><p>Repository modules, Rust checks, cross-language smoke tests, ANN benchmarks, and storage compatibility.</p><a class="card-link" href="development.html">Open the development guide →</a></article>
           <article class="card"><h3>DiskANN deployment and tuning</h3><p>Understand the memory, local, remote, and object-store profiles, resident-memory model, build parameters, and production-readiness boundary.</p><a class="card-link" href="diskann.html">Open the DiskANN guide →</a></article>
           <article class="card"><h3>Releases and verification</h3><p>Download signed source releases, create a release candidate, or independently verify one before voting.</p><a class="card-link" href="releases.html">Open the release guides →</a></article>
@@ -112,6 +114,20 @@
               <tr data-index-row data-fit="compact recall"><td><a href="ivf-rq.html">IVF-RQ</a></td><td>Multi-bit rotated residual levels + coarse/full factors</td><td>Bounded sign-plane scan, then full bit-plane refinement</td><td>Default about <code>padded_d/2+20</code> bytes</td><td>Measured 0.82–0.91 Recall@10 across GloVe-100, SIFT1M, and GIST1M at four bits</td><td>Low to medium</td><td>Automatic <code>nlist</code>/<code>nprobe</code>; budget-based bits; explicit overrides</td><td>Configurable multi-bit compression when SQ codes are too large; measure recall and scan cost at the chosen width</td></tr>
               <tr data-index-row data-fit="recall latency"><td><a href="diskann.html">DiskANN</a></td><td>Global Vamana + resident PQ + persisted rerank vectors</td><td>PQ-guided graph traversal and F32/F16 rerank</td><td><code>E·d + pq.m + 4(R+1)</code> bytes, approximately; <code>E=4</code> or <code>2</code></td><td>Approximate candidate discovery; F32-exact or F16-quantized distances for reranked candidates</td><td>Very high</td><td>Build preset + deployment/capacity objectives; calibrated automatic <code>l_search</code></td><td>Immutable L2 on local SSD when high recall and sub-MiB query reads repay the long build</td></tr>
               <tr data-index-row data-fit="recall simple"><td><a href="ivf-flat.html">IVF-FLAT</a></td><td>Raw <code>f32</code> vectors</td><td>Exact distance scan in probed lists</td><td>About <code>4d</code> bytes</td><td>No quantization loss; recall mainly depends on <code>nprobe</code></td><td>Low</td><td>Automatic <code>nlist</code>/<code>nprobe</code>; explicit overrides</td><td>Recall ceiling, frequent rebuilds, IP/cosine, or production sets whose scan bytes are affordable</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>Distance range search support</h3>
+        <p><a href="range-search.html">Range search</a> returns every probed row inside a half-open distance band <code>[lower, upper)</code> with no result limit, rather than a fixed number of nearest neighbours. Unsupported combinations fail loud so a caller can fall back to a scan instead of receiving a silently incomplete answer.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Index</th><th>Range search</th><th>Membership decided on</th><th>Note</th></tr></thead>
+            <tbody>
+              <tr><td><a href="ivf-flat.html">IVF-FLAT</a></td><td>Supported, <code>l2</code> only</td><td>Exact distance</td><td>A probed row's membership is exact, so at <code>nprobe = nlist</code> the in-band set is complete — among allow-listed rows, when a filter is supplied</td></tr>
+              <tr><td><a href="ivf-rq.html">IVF-RQ</a></td><td>Planned</td><td>Estimate</td><td>An estimate on the wrong side of a cut removes the row entirely, so prefer IVF-FLAT when completeness matters; accuracy will be measured in the contribution that enables it</td></tr>
+              <tr><td><a href="ivf-sq.html">IVF-SQ</a></td><td>Planned</td><td>Estimate</td><td>As above</td></tr>
+              <tr><td><a href="ivf-pq.html">IVF-PQ</a></td><td>Planned</td><td>Estimate</td><td>As above; would use the float-LUT path rather than fastscan</td></tr>
+              <tr><td><a href="diskann.html">DiskANN</a></td><td>Not planned</td><td>—</td><td>Graph traversal is inherently <em>k</em>-oriented and has no natural radius termination criterion</td></tr>
             </tbody>
           </table>
         </div>

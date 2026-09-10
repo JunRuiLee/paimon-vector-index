@@ -18,7 +18,7 @@
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="site-header"><div class="header-inner">
     <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
-    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html" aria-current="page">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a><a href="releases.html">Releases</a></nav>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html" aria-current="page">API</a><a href="development.html">Development</a><a href="range-search.html">Range search</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a><a href="releases.html">Releases</a></nav>
     <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
   </div></header>
 
@@ -31,7 +31,7 @@
     </section>
 
     <div class="doc-layout">
-      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#workspace">Modules</a><a href="#lifecycle">Lifecycle</a><a href="#params">Search parameters</a><a href="#reader-options">Reader options</a><a href="#warmup">Warm-up</a><a href="#rust">Rust</a><a href="#c">C FFI</a><a href="#cpp">C++</a><a href="#java">Java/JNI</a><a href="#python">Python</a><a href="#filter">Filter pushdown</a></aside>
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#workspace">Modules</a><a href="#lifecycle">Lifecycle</a><a href="#params">Search parameters</a><a href="#range">Range search</a><a href="#reader-options">Reader options</a><a href="#warmup">Warm-up</a><a href="#rust">Rust</a><a href="#c">C FFI</a><a href="#cpp">C++</a><a href="#java">Java/JNI</a><a href="#python">Python</a><a href="#filter">Filter pushdown</a></aside>
       <article class="article">
         <section class="article-section" id="workspace">
           <h2>Public integration layers</h2>
@@ -72,6 +72,32 @@
           </tbody></table></div>
           <p>Use the binding's <code>automatic</code> search-parameter constructor. For DiskANN, <code>calibrate_search_width</code> / <code>calibrateSearchWidth</code> evaluates widths 100, 200, and 400 on representative queries and remembers the smallest adjacent pair with at least 98% Top-K result overlap. This is a stability proxy, not a ground-truth recall guarantee; explicit widths always win.</p>
           <div class="callout"><strong>IVF-RQ width is a build option</strong><code>rq.bits</code> accepts 1–8 and defaults to 4. It is persisted in the file and reported as <code>rq_bits</code> / <code>rqBits</code> metadata; search has no separate bit-width switch.</div>
+        </section>
+
+        <section class="article-section" id="range">
+          <h2>Range search parameters and results</h2>
+          <p>Range search returns every probed row inside a half-open distance band instead of a fixed number of nearest neighbours. It is currently available on IVF-FLAT with the <code>l2</code> metric; the other families and metrics report the request as unsupported so a caller can fall back. See <a href="range-search.html">Range search</a> for the full semantic contract.</p>
+          <div class="table-wrap"><table><thead><tr><th>Entry point</th><th>Signature</th></tr></thead><tbody>
+            <tr><td>Single query</td><td><code>range_search(query, params)</code></td></tr>
+            <tr><td>Single query, filtered</td><td><code>range_search_with_roaring_filter(query, params, filter_bytes)</code></td></tr>
+            <tr><td>Batch</td><td><code>range_search_batch(queries, query_count, params)</code></td></tr>
+            <tr><td>Batch, filtered</td><td><code>range_search_batch_with_roaring_filter(queries, query_count, params, filter_bytes)</code></td></tr>
+          </tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Description</th></tr></thead><tbody>
+            <tr><td><code>DistanceBand</code></td><td>A validated half-open interval <code>[lower, upper)</code> carrying its metric. Each side is either <code>Finite(f32)</code> or <code>Unbounded</code>; unboundedness is a distinct state rather than a sentinel number. Build it from cuts with <code>new</code>, or from a SQL predicate's endpoints with <code>from_endpoints</code>. An empty band where <code>lower == upper</code> is legal and returns zero rows.</td></tr>
+            <tr><td><code>DistanceEndpoint</code></td><td>One side of a predicate: the already-folded literal plus its <code>CutOperator</code>. <code>lower</code> accepts <code>Ge</code>/<code>Gt</code> and <code>upper</code> accepts <code>Le</code>/<code>Lt</code>; a mismatch is rejected rather than reinterpreted.</td></tr>
+            <tr><td><code>VectorRangeSearchParams</code></td><td>Carries the band and the probe width. Construct with <code>new(band, nprobe)</code>. <code>nprobe</code> is clamped to <code>nlist</code> exactly as the Top-K path clamps its width, and 0 is rejected.</td></tr>
+            <tr><td><code>RangeSearchWidth</code></td><td>Probe width, either <code>Fixed</code> or <code>Auto</code>. <code>Auto</code> reports unsupported until it is implemented, rather than being silently ignored.</td></tr>
+          </tbody></table></div>
+          <p>Results use a CSR layout because the row count per query is not known in advance. Three contiguous buffers are shared by the whole batch, and query <code>i</code> owns the slice delimited by <code>lims</code>:</p>
+          <div class="table-wrap"><table><thead><tr><th>Field</th><th>Length</th><th>Description</th></tr></thead><tbody>
+            <tr><td><code>lims</code></td><td><code>query_count + 1</code></td><td>Offsets: query <code>i</code> spans <code>lims[i]..lims[i+1]</code>.</td></tr>
+            <tr><td><code>labels</code></td><td>Total rows</td><td>Row IDs, in no promised order.</td></tr>
+            <tr><td><code>distances</code></td><td>Total rows</td><td>Distances in the index's own space, so squared for <code>l2</code>.</td></tr>
+            <tr><td><code>query(i).stats</code></td><td>Per query</td><td><code>lists_probed</code>, <code>rows_scanned</code> (includes rejected and early-abandoned rows), <code>rows_committed</code>, <code>early_abandoned</code>, and <code>stop_reason</code>.</td></tr>
+            <tr><td><code>call_stats()</code></td><td>One per call</td><td><code>list_reads</code>, <code>list_rereads</code>, <code>passes</code>, and <code>peak_pending_result_rows</code>. These are call-level because a per-query peak cannot establish a call-wide concurrent peak.</td></tr>
+          </tbody></table></div>
+          <div class="callout"><strong><code>query(i)</code> panics on an out-of-range index</strong>It does not return an empty result, which would mask a caller's off-by-one as "this query matched nothing".</div>
         </section>
 
         <section class="article-section" id="reader-options">
