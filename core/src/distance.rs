@@ -93,6 +93,86 @@ pub fn fvec_l2sqr_scaled_exceeds(a: &[f32], b: &[f32], scale: f32, threshold: f3
     fvec_l2sqr_scaled_exceeds_simd(a, b, scale, threshold)
 }
 
+/// How often an early-abandon kernel reads its running sum, in elements.
+///
+/// Wide enough that the reduction is not the loop's main cost -- one per 128
+/// elements, against a load, subtract and multiply-add for each of them -- and
+/// narrow enough to abandon a long vector early. Probing every 8-element block
+/// would put a reduction between consecutive accumulations. The value is not
+/// tuned against a measurement, and a benchmark may well move it.
+const L2_PROBE_STRIDE: usize = 128;
+
+/// The squared L2 distance, unless the accumulation passes `threshold` first.
+///
+/// `Some(d)` is **bit-identical to [`fvec_l2sqr`]**: the same accumulation, read
+/// without disturbing it at [`L2_PROBE_STRIDE`] boundaries, rather than a second
+/// differently ordered one. `None` means the distance is above `threshold`.
+///
+/// That bit-identity is the point. An admitted candidate is traversed once, and
+/// a caller may prune against its raw cut with no margin, because the value
+/// compared is a prefix of the value that will be committed: for finite
+/// operands every term is non-negative, so the sum only grows and the reduction
+/// is monotone in every lane.
+///
+/// Finite operands are an unchecked precondition -- validating them would cost a
+/// pass over both vectors. A NaN reaching the accumulation disables pruning
+/// rather than corrupting it, since comparisons against NaN are false, so
+/// `Some(NaN)` comes back for the caller to reject. A non-finite `threshold` is
+/// supported: `+inf` and NaN abandon nothing, `-inf` rejects everything.
+///
+/// [`fvec_l2sqr_scaled_exceeds`] remains for callers that only need the boolean
+/// and carry a scale factor.
+#[inline]
+pub fn fvec_l2sqr_unless_exceeds(a: &[f32], b: &[f32], threshold: f32) -> Option<f32> {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "fvec_l2sqr_unless_exceeds inputs must have the same length"
+    );
+    // A squared distance is non-negative, so nothing can sit at or below a
+    // negative cut. `-inf` is covered here too, before the check below.
+    if threshold < 0.0 {
+        return None;
+    }
+    // Past that guard the only non-finite thresholds left are `+inf` and NaN,
+    // and neither can abandon anything: no sum exceeds `+inf`, and every comparison against NaN is
+    // false. Probing a sum that cannot fail the test is pure cost -- a
+    // horizontal reduction per stride, or a comparison per element on the
+    // scalar path -- so this hands the work to the plain kernel. It is the same
+    // accumulation, so the returned bits are unaffected.
+    if !threshold.is_finite() {
+        return Some(fvec_l2sqr_simd(a, b));
+    }
+    fvec_l2sqr_unless_exceeds_simd(a, b, threshold)
+}
+
+// The dispatch below must select the same kernel as `fvec_l2sqr_simd` for the
+// same input, or the two stop being bit-identical on the boundary between the
+// SIMD and scalar paths. The conditions are therefore duplicated verbatim
+// rather than paraphrased.
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fvec_l2sqr_unless_exceeds_simd(a: &[f32], b: &[f32], threshold: f32) -> Option<f32> {
+    if is_x86_feature_detected!("avx2") && a.len() >= 8 {
+        unsafe { fvec_l2sqr_unless_exceeds_avx2(a, b, threshold) }
+    } else {
+        fvec_l2sqr_unless_exceeds_scalar(a, b, threshold)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn fvec_l2sqr_unless_exceeds_simd(a: &[f32], b: &[f32], threshold: f32) -> Option<f32> {
+    unsafe { fvec_l2sqr_unless_exceeds_neon(a, b, threshold) }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn fvec_l2sqr_unless_exceeds_simd(a: &[f32], b: &[f32], threshold: f32) -> Option<f32> {
+    fvec_l2sqr_unless_exceeds_scalar(a, b, threshold)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn fvec_l2sqr_simd(a: &[f32], b: &[f32]) -> f32 {
@@ -173,6 +253,25 @@ fn fvec_l2sqr_scalar(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Mirrors [`fvec_l2sqr_scalar`] term for term, so the value it returns on
+/// completion is the one that function would have produced.
+#[cfg(any(
+    target_arch = "x86_64",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[inline]
+fn fvec_l2sqr_unless_exceeds_scalar(a: &[f32], b: &[f32], threshold: f32) -> Option<f32> {
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        let d = a[i] - b[i];
+        sum += d * d;
+        if sum > threshold {
+            return None;
+        }
+    }
+    Some(sum)
+}
+
 #[cfg(any(
     target_arch = "x86_64",
     not(any(target_arch = "x86_64", target_arch = "aarch64"))
@@ -208,6 +307,24 @@ fn fvec_l2sqr_scaled_exceeds_scalar(a: &[f32], b: &[f32], scale: f32, threshold:
     false
 }
 
+/// The horizontal reduction every AVX2 L2 kernel ends with.
+///
+/// Shared rather than repeated because two kernels are only bit-identical while
+/// their accumulation **and** their reduction agree; a copy could drift.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn horizontal_sum_avx2(sum: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+
+    let hi = _mm256_extractf128_ps::<1>(sum);
+    let lo = _mm256_castps256_ps128(sum);
+    let sum128 = _mm_add_ps(lo, hi);
+    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
+    _mm_cvtss_f32(sum32)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn fvec_l2sqr_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -224,12 +341,7 @@ unsafe fn fvec_l2sqr_avx2(a: &[f32], b: &[f32]) -> f32 {
         i += 8;
     }
 
-    let hi = _mm256_extractf128_ps::<1>(sum);
-    let lo = _mm256_castps256_ps128(sum);
-    let sum128 = _mm_add_ps(lo, hi);
-    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
-    let mut result = _mm_cvtss_f32(sum32);
+    let mut result = unsafe { horizontal_sum_avx2(sum) };
 
     while i < n {
         let d = unsafe { *a.get_unchecked(i) - *b.get_unchecked(i) };
@@ -237,6 +349,48 @@ unsafe fn fvec_l2sqr_avx2(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     result
+}
+
+/// The early-abandoning twin of [`fvec_l2sqr_avx2`]: the same accumulator, the
+/// same order and the same reduction, with the running sum read at
+/// [`L2_PROBE_STRIDE`] boundaries. Reading it does not disturb it, so a
+/// completed call returns exactly what `fvec_l2sqr_avx2` would.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fvec_l2sqr_unless_exceeds_avx2(a: &[f32], b: &[f32], threshold: f32) -> Option<f32> {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let mut sum = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        let diff = _mm256_sub_ps(va, vb);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+        i += 8;
+        if i % L2_PROBE_STRIDE == 0 && unsafe { horizontal_sum_avx2(sum) } > threshold {
+            return None;
+        }
+    }
+
+    // The probe only fires on a stride boundary, and the tail below is empty
+    // whenever `n` is a multiple of 8, so without this the whole check could be
+    // skipped -- at d = 8, for instance.
+    let mut result = unsafe { horizontal_sum_avx2(sum) };
+    if result > threshold {
+        return None;
+    }
+
+    while i < n {
+        let d = unsafe { *a.get_unchecked(i) - *b.get_unchecked(i) };
+        result += d * d;
+        if result > threshold {
+            return None;
+        }
+        i += 1;
+    }
+    Some(result)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -356,6 +510,54 @@ unsafe fn fvec_l2sqr_scaled_exceeds_avx2(a: &[f32], b: &[f32], scale: f32, thres
         i += 1;
     }
     false
+}
+
+/// The early-abandoning twin of [`fvec_l2sqr_neon`]: the same two accumulators,
+/// the same order and the same reduction, with the running sum read at
+/// [`L2_PROBE_STRIDE`] boundaries. Reading it does not disturb it, so a
+/// completed call returns exactly what `fvec_l2sqr_neon` would.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fvec_l2sqr_unless_exceeds_neon(a: &[f32], b: &[f32], threshold: f32) -> Option<f32> {
+    use std::arch::aarch64::*;
+
+    let n = a.len();
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + 8 <= n {
+        let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+        let vb0 = unsafe { vld1q_f32(b.as_ptr().add(i)) };
+        let diff0 = vsubq_f32(va0, vb0);
+        sum0 = vmlaq_f32(sum0, diff0, diff0);
+
+        let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+        let vb1 = unsafe { vld1q_f32(b.as_ptr().add(i + 4)) };
+        let diff1 = vsubq_f32(va1, vb1);
+        sum1 = vmlaq_f32(sum1, diff1, diff1);
+
+        i += 8;
+        if i % L2_PROBE_STRIDE == 0 && vaddvq_f32(vaddq_f32(sum0, sum1)) > threshold {
+            return None;
+        }
+    }
+
+    // The probe only fires on a stride boundary, and the tail below is empty
+    // whenever `n` is a multiple of 8, so without this the whole check could be
+    // skipped -- at d = 8, for instance.
+    let mut result = vaddvq_f32(vaddq_f32(sum0, sum1));
+    if result > threshold {
+        return None;
+    }
+    while i < n {
+        let d = unsafe { *a.get_unchecked(i) - *b.get_unchecked(i) };
+        result += d * d;
+        if result > threshold {
+            return None;
+        }
+        i += 1;
+    }
+    Some(result)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1317,5 +1519,212 @@ mod tests {
         let dist = pq_distance_scalar(&table, &codes, 2, 4);
         // table[0*4 + 1] + table[1*4 + 3] = 0.2 + 0.8 = 1.0
         assert!((dist - 1.0).abs() < 1e-6);
+    }
+
+    // --- fvec_l2sqr_unless_exceeds ---------------------------------------
+    //
+    // Assertions are against `fvec_l2sqr`, not frozen f32 literals: bit
+    // identity with that function is the contract, and a literal would encode
+    // this machine's accumulation and fail on another.
+
+    fn xorshift(state: &mut u32) -> f32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        // 24 bits of mantissa mapped into [-1, 1): all normal, so no case here
+        // quietly turns into a subnormal or zero regime.
+        (*state >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    }
+
+    fn deterministic_pair(d: usize, seed: u32) -> (Vec<f32>, Vec<f32>) {
+        let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+        let a = (0..d).map(|_| xorshift(&mut state)).collect();
+        let b = (0..d).map(|_| xorshift(&mut state)).collect();
+        (a, b)
+    }
+
+    /// Dimensions chosen to cross every structural boundary of the kernels: the
+    /// 8-lane vector body, the scalar tail, the probe stride, and -- at 257 --
+    /// several strides followed by a tail.
+    const SHAPES: [usize; 12] = [0, 1, 7, 8, 9, 127, 128, 129, 255, 256, 257, 768];
+
+    /// Whether a call at this dimension reaches a vector kernel, and so a
+    /// probe, rather than the scalar one.
+    ///
+    /// Mirrors the dispatch in `fvec_l2sqr_unless_exceeds_simd`. Asserting probe
+    /// coverage from `d` alone would claim it on an x86_64 machine without AVX2,
+    /// where every call takes the scalar path and no probe runs.
+    fn reaches_a_probe(d: usize) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("avx2") && d >= L2_PROBE_STRIDE
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            d >= L2_PROBE_STRIDE
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = d;
+            false
+        }
+    }
+
+    #[test]
+    fn an_admitting_call_returns_exactly_what_fvec_l2sqr_returns() {
+        // The threshold is finite on purpose. `f32::INFINITY` would take the
+        // shortcut in `fvec_l2sqr_unless_exceeds`, which calls the plain kernel
+        // and so proves nothing about the probing one -- this test asserted
+        // exactly that, vacuously, until the shortcut was added. `f32::MAX` is
+        // finite, above every distance these fixtures produce, and therefore
+        // runs the probing kernel to completion.
+        let mut probed = 0usize;
+        for &d in &SHAPES {
+            for seed in 0..32u32 {
+                let (a, b) = deterministic_pair(d, seed);
+                let exact = fvec_l2sqr(&a, &b);
+                // d = 0 legitimately sums to zero; every other shape must
+                // produce a normal value or the case is vacuous.
+                assert!(
+                    exact.is_normal() || d == 0,
+                    "d={d} seed={seed}: degenerate fixture"
+                );
+                assert!(exact < f32::MAX, "d={d} seed={seed}: fixture too large");
+                let value = fvec_l2sqr_unless_exceeds(&a, &b, f32::MAX)
+                    .expect("a threshold above the distance cannot abandon");
+                assert_eq!(
+                    value.to_bits(),
+                    exact.to_bits(),
+                    "d={d} seed={seed}: {value:?} vs {exact:?}"
+                );
+                if reaches_a_probe(d) {
+                    probed += 1;
+                }
+            }
+        }
+        // Reading the accumulator is the step that could perturb it, so on a
+        // machine that dispatches to a vector kernel a run reaching no probe
+        // would not have tested anything. Where dispatch is scalar there is no
+        // probe to reach and the assertion would be false, so it is conditional
+        // rather than unconditional-and-occasionally-wrong.
+        if reaches_a_probe(L2_PROBE_STRIDE) {
+            assert!(probed >= 96, "only {probed} cases reached a probe");
+        }
+    }
+
+    #[test]
+    fn a_distance_equal_to_the_threshold_is_never_abandoned() {
+        // The tightest admissible row there is, and the exact case an earlier
+        // design lost: a pruning pass that accumulated differently from the
+        // committed one could rise above the cut on a row whose committed
+        // distance sits precisely at it. Reading one accumulation instead of
+        // reconciling two makes that unrepresentable, and this pins it.
+        let mut abandoned = Vec::new();
+        let mut checked = 0usize;
+        for &d in &SHAPES {
+            for seed in 0..32u32 {
+                let (a, b) = deterministic_pair(d, seed);
+                let exact = fvec_l2sqr(&a, &b);
+                match fvec_l2sqr_unless_exceeds(&a, &b, exact) {
+                    Some(value) => assert_eq!(
+                        value.to_bits(),
+                        exact.to_bits(),
+                        "d={d} seed={seed}: admitted with the wrong bits"
+                    ),
+                    None => abandoned.push((d, seed, exact)),
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            abandoned.is_empty(),
+            "{} of {checked} rows sitting exactly on their own cut were abandoned: {:?}",
+            abandoned.len(),
+            &abandoned[..abandoned.len().min(4)]
+        );
+        assert_eq!(checked, SHAPES.len() * 32);
+    }
+
+    #[test]
+    fn a_distance_above_the_threshold_is_abandoned() {
+        // Without this the test above is satisfied by a kernel that never
+        // abandons anything.
+        for &d in &SHAPES {
+            for seed in 0..32u32 {
+                let (a, b) = deterministic_pair(d, seed);
+                let exact = fvec_l2sqr(&a, &b);
+                if d == 0 {
+                    // Nothing is above a zero distance, so this shape has no
+                    // abandonable case to contribute.
+                    continue;
+                }
+                let threshold = exact * 0.5;
+                assert!(threshold < exact, "d={d} seed={seed}: fixture too small");
+                assert_eq!(
+                    fvec_l2sqr_unless_exceeds(&a, &b, threshold),
+                    None,
+                    "d={d} seed={seed}: {exact:?} is above {threshold:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_threshold_that_cannot_abandon_takes_the_plain_kernel_and_returns_its_bits() {
+        // `+inf` and NaN can abandon nothing, so they skip the probing kernel.
+        // `-inf` is non-finite too but is not in this group: it rejects
+        // everything, and `a_negative_threshold_...` covers it.
+        // That shortcut is only safe while it accumulates identically, which is
+        // what this pins -- a future `fvec_l2sqr_simd` that diverged would make
+        // the threshold silently decide the returned bits.
+        for &d in &SHAPES {
+            for seed in 0..8u32 {
+                let (a, b) = deterministic_pair(d, seed);
+                let exact = fvec_l2sqr(&a, &b);
+                for threshold in [f32::INFINITY, f32::NAN] {
+                    let value = fvec_l2sqr_unless_exceeds(&a, &b, threshold)
+                        .expect("a non-finite threshold cannot abandon");
+                    assert_eq!(
+                        value.to_bits(),
+                        exact.to_bits(),
+                        "d={d} seed={seed} threshold={threshold:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_nan_coordinate_disables_pruning_rather_than_corrupting_it() {
+        // Documented behaviour outside the finite domain: a NaN reached by the
+        // accumulation makes every later comparison false, so the row completes
+        // and the caller gets `Some(NaN)` to reject -- `RangeCollector::push`
+        // turns it into `InvalidData`. It must not come back as a plausible
+        // finite distance.
+        let mut a = vec![0.25f32; 130];
+        let b = vec![0.0f32; 130];
+        a[129] = f32::NAN;
+        let value = fvec_l2sqr_unless_exceeds(&a, &b, 1.0e9)
+            .expect("a threshold above the accumulated prefix cannot abandon");
+        assert!(value.is_nan(), "got {value:?}");
+
+        // And the other side of the documented behaviour: a prefix that passes
+        // the cut before the NaN is reached is abandoned on what it did see,
+        // exactly as the previous two-kernel scan abandoned it.
+        assert_eq!(fvec_l2sqr_unless_exceeds(&a, &b, 1.0), None);
+        assert!(fvec_l2sqr_scaled_exceeds(&a, &b, 1.0, 1.0));
+    }
+
+    #[test]
+    fn a_negative_threshold_admits_nothing_and_an_equal_pair_still_computes() {
+        let a = [1.0f32, 2.0, 3.0];
+        assert_eq!(fvec_l2sqr_unless_exceeds(&a, &a, -1.0), None);
+        // Negative infinity is a negative cut, not a non-finite shortcut: it
+        // must reject rather than compute. The ordering of the two guards is
+        // what decides that, so it is pinned here.
+        assert_eq!(fvec_l2sqr_unless_exceeds(&a, &a, f32::NEG_INFINITY), None);
+        // Distance zero against a zero cut: `sum > 0.0` is false, so the row is
+        // computed rather than abandoned, matching `fvec_l2sqr`.
+        assert_eq!(fvec_l2sqr_unless_exceeds(&a, &a, 0.0), Some(0.0));
     }
 }

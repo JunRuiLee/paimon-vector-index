@@ -1851,7 +1851,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
     /// the duplication costs nothing measurable.
     fn validate_range_request(&self, params: &VectorRangeSearchParams) -> io::Result<()> {
         let metadata = self.metadata();
-        params.validate_shape(metadata.nlist)?;
+        params.validate_shape()?;
         let index_metric = metadata.metric;
         if params.band().metric() != index_metric {
             return Err(io::Error::new(

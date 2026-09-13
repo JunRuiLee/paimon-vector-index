@@ -16,9 +16,7 @@
 // under the License.
 
 use crate::collect::{Collector, RangeCollector};
-use crate::distance::{
-    fvec_l2sqr, fvec_l2sqr_scaled_exceeds, fvec_normalize, MetricType, QueryDistance,
-};
+use crate::distance::{fvec_l2sqr_unless_exceeds, fvec_normalize, MetricType, QueryDistance};
 use crate::index::validate_queries;
 use crate::index_io_util::{
     bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, ivf_payload_is_oversized,
@@ -952,7 +950,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 self.for_each_streamed_list_chunk(first_list, |ids, vectors| {
                     for &qi in query_indices {
                         let q = &queries[qi * d..(qi + 1) * d];
-                        let mut collector = RangeCollector::new(band, d);
+                        let mut collector = RangeCollector::new(band);
                         scan_flat_rows(q, ids, vectors, d, metric, filter, &mut collector)?;
                         let mut tally = tallies[qi].lock().expect("tally lock");
                         tally.0 += collector.scanned();
@@ -986,7 +984,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             let band = params.band();
             let scan_one = |list: &FlatListData, qi: usize| -> io::Result<()> {
                 let q = &queries[qi * d..(qi + 1) * d];
-                let mut collector = RangeCollector::new(band, d);
+                let mut collector = RangeCollector::new(band);
                 scan_flat_list(q, list, d, metric, filter, &mut collector)?;
                 let mut tally = tallies[qi].lock().expect("tally lock");
                 tally.0 += collector.scanned();
@@ -1346,14 +1344,19 @@ fn scan_flat_rows<C: Collector>(
         }
         let vector = &vectors[local_idx * d..(local_idx + 1) * d];
         let distance = if metric == MetricType::L2 {
-            let threshold = collector.cutoff();
-            // An infinite cutoff can never abandon a row, so entering the
-            // kernel would only cost a wasted SIMD pass over it.
-            if threshold.is_finite() && fvec_l2sqr_scaled_exceeds(query, vector, 1.0, threshold) {
-                collector.note_abandoned();
-                continue;
+            // One traversal, whatever the outcome: the kernel abandons against
+            // the collector's cutoff and otherwise hands back the value
+            // `fvec_l2sqr` would have computed, so an admitted candidate is not
+            // walked a second time to obtain its distance. An infinite cutoff
+            // needs no special case -- nothing compares above it, so the row is
+            // simply computed.
+            match fvec_l2sqr_unless_exceeds(query, vector, collector.cutoff()) {
+                Some(distance) => distance,
+                None => {
+                    collector.note_abandoned();
+                    continue;
+                }
             }
-            fvec_l2sqr(query, vector)
         } else {
             distance_context.distance_to(vector, None)
         };

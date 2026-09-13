@@ -330,22 +330,6 @@ impl DistanceBand {
     }
 }
 
-/// Why a scan stopped.
-///
-/// A Rust API type only, like [`CutOperator`]: no numeric or C ABI
-/// representation is fixed here, because no binding layer exists yet to
-/// consume one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StopReason {
-    /// Every probed list was walked to completion; an empty band lands here too.
-    #[default]
-    Exhausted,
-    /// Stopped early on consecutive empty buckets.
-    EmptyBuckets,
-    /// Hit the configured result cap.
-    LimitReached,
-}
-
 /// Per-query statistics. Fields stay private so they can be extended.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RangeSearchStats {
@@ -353,7 +337,6 @@ pub struct RangeSearchStats {
     rows_scanned: usize,
     rows_committed: usize,
     early_abandoned: usize,
-    stop_reason: StopReason,
 }
 
 impl RangeSearchStats {
@@ -370,13 +353,16 @@ impl RangeSearchStats {
     pub fn rows_committed(&self) -> usize {
         self.rows_committed
     }
+    /// Rows the scan rejected against the abandon cutoff rather than evaluating
+    /// into the band test, which for IVF-Flat under L2 means their distance is
+    /// above the band's upper cut.
+    ///
+    /// A diagnostic, not a work measure: a row is counted whether the kernel
+    /// stopped at its first term or at its last, so this is not the number of
+    /// rows whose evaluation was short-circuited. `rows_scanned` counts these
+    /// rows too.
     pub fn early_abandoned(&self) -> usize {
         self.early_abandoned
-    }
-    /// Always [`StopReason::Exhausted`] in this version. The other two variants
-    /// become reachable once early stopping and result caps land.
-    pub fn stop_reason(&self) -> StopReason {
-        self.stop_reason
     }
 }
 
@@ -403,9 +389,6 @@ impl RangeSearchCallStats {
 pub struct QueryResult<'a> {
     pub labels: &'a [i64],
     pub distances: &'a [f32],
-    /// Always `false` in this version: there is no result cap yet, so nothing
-    /// can set it. Do not branch on it until caps land.
-    pub limit_reached: bool,
     pub stats: &'a RangeSearchStats,
 }
 
@@ -418,7 +401,6 @@ pub struct RangeSearchResult {
     lims: Vec<usize>,
     labels: Vec<i64>,
     distances: Vec<f32>,
-    limit_reached: Vec<u8>,
     stats: Vec<RangeSearchStats>,
     call_stats: RangeSearchCallStats,
 }
@@ -435,7 +417,6 @@ impl RangeSearchResult {
         QueryResult {
             labels: &self.labels[start..end],
             distances: &self.distances[start..end],
-            limit_reached: self.limit_reached[i] != 0,
             stats: &self.stats[i],
         }
     }
@@ -468,7 +449,6 @@ impl RangeSearchResult {
 /// [`build`]: RangeResultBuilder::build
 pub(crate) struct RangeResultBuilder {
     rows: Vec<Vec<(i64, f32)>>,
-    limit_reached: Vec<u8>,
     stats: Vec<RangeSearchStats>,
     call_stats: RangeSearchCallStats,
 }
@@ -477,7 +457,6 @@ impl RangeResultBuilder {
     pub(crate) fn new(nq: usize) -> Self {
         Self {
             rows: vec![Vec::new(); nq],
-            limit_reached: vec![0; nq],
             stats: vec![RangeSearchStats::default(); nq],
             call_stats: RangeSearchCallStats::default(),
         }
@@ -538,7 +517,6 @@ impl RangeResultBuilder {
             lims,
             labels,
             distances,
-            limit_reached: self.limit_reached,
             stats: self.stats,
             call_stats: self.call_stats,
         }
@@ -560,50 +538,26 @@ impl RangeResultBuilder {
     }
 }
 
-/// The probe width for a range search. Both variants ship from the first
-/// version and the enum is `#[non_exhaustive]`: `Auto` fails loud with
-/// `Unsupported` until it is implemented, rather than being silently ignored, so
-/// the public enum is stable from day one and does not have to grow a variant
-/// later.
-///
-/// The existing `SearchWidth` is deliberately not reused: it carries a
-/// `DiskAnnLSearch` variant, and range search does not support DiskANN, so
-/// reusing it would drag a permanently illegal variant into the new API.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RangeSearchWidth {
-    Fixed {
-        nprobe: usize,
-    },
-    Auto {
-        initial: usize,
-        growth_factor: usize,
-        max_width: usize,
-    },
-}
-
 /// Range search parameters. **Fields are private**: knobs introduced by later
 /// work would break struct-literal construction if they were `pub` fields, while
 /// declaring them now without implementing them would mean accepting a silently
-/// ineffective parameter. Private fields plus `new()` and `with_*` remove that
-/// dilemma.
+/// ineffective parameter. Private fields plus `new()` remove that dilemma, and
+/// a later width mode can arrive as an added constructor without breaking this
+/// one.
+///
+/// The probe width is a plain `nprobe`. An automatically widening mode is
+/// deliberately absent rather than present-but-unsupported: a variant every
+/// well-formed value of which only ever returns `Unsupported` is public surface
+/// with no working use.
 #[derive(Debug, Clone, Copy)]
 pub struct VectorRangeSearchParams {
     band: DistanceBand,
-    width: RangeSearchWidth,
+    nprobe: usize,
 }
 
 impl VectorRangeSearchParams {
     pub fn new(band: DistanceBand, nprobe: usize) -> Self {
-        Self {
-            band,
-            width: RangeSearchWidth::Fixed { nprobe },
-        }
-    }
-
-    pub fn with_width(mut self, width: RangeSearchWidth) -> Self {
-        self.width = width;
-        self
+        Self { band, nprobe }
     }
 
     pub fn band(&self) -> DistanceBand {
@@ -617,53 +571,11 @@ impl VectorRangeSearchParams {
     /// Without this, a family that returns `Unsupported` would swallow an
     /// invalid width: an FFI caller reading `Unsupported` as "fall back to a
     /// scan" would silently paper over its own bug.
-    ///
-    /// Takes `nlist` because one rule is clamp-dependent: `max_width` below
-    /// `initial` is only decidable once both have been clamped. Every family
-    /// knows its own `nlist` (a graph index reports 1), so this stays callable
-    /// before the capability check.
-    pub(crate) fn validate_shape(&self, nlist: usize) -> io::Result<()> {
-        match self.width {
-            RangeSearchWidth::Fixed { nprobe: 0 } => {
-                Err(invalid("range search nprobe must be greater than 0"))
-            }
-            RangeSearchWidth::Fixed { .. } => Ok(()),
-            // `Auto` is not implemented yet, but its fields are still validated
-            // here: malformed values are a caller bug and must not be masked by
-            // the capability gap that `validate` reports for the mode itself.
-            RangeSearchWidth::Auto {
-                initial,
-                growth_factor,
-                max_width,
-            } => {
-                if initial == 0 {
-                    return Err(invalid(
-                        "automatic range width initial must be greater than 0",
-                    ));
-                }
-                if growth_factor < 2 {
-                    return Err(invalid(format!(
-                        "automatic range width growth_factor must be at least 2, got {growth_factor}"
-                    )));
-                }
-                if max_width == 0 {
-                    return Err(invalid(
-                        "automatic range width max_width must be greater than 0",
-                    ));
-                }
-                // Clamp each bound to `nlist` first, then compare. Comparing
-                // before clamping would accept `initial > nlist` together with
-                // `max_width > nlist` and then clamp only one, leaving the
-                // self-contradictory `max_width < initial`.
-                if max_width.min(nlist) < initial.min(nlist) {
-                    return Err(invalid(format!(
-                        "automatic range width max_width {max_width} is below initial \
-                         {initial} after clamping to nlist {nlist}"
-                    )));
-                }
-                Ok(())
-            }
+    pub(crate) fn validate_shape(&self) -> io::Result<()> {
+        if self.nprobe == 0 {
+            return Err(invalid("range search nprobe must be greater than 0"));
         }
+        Ok(())
     }
 
     /// Validates and returns the effective nprobe, clamped to `nlist`.
@@ -674,21 +586,13 @@ impl VectorRangeSearchParams {
     /// equivalent resolution private for the same reason. Callers get
     /// validation implicitly, by calling a search method.
     pub(crate) fn validate(&self, nlist: usize) -> io::Result<usize> {
-        // A caller bug outranks a capability gap, so the shape checks run before
+        // A caller bug outranks a capability gap, so the shape check runs before
         // the metric check. Reversing the two would report a zero nprobe on an
         // uncertified metric as `Unsupported`, and an FFI caller would silently
         // fall back to a scan instead of surfacing the bug.
-        // Every caller-bug check runs first, the clamp-dependent one included, so
-        // none of them can be masked by the capability gap reported below.
-        self.validate_shape(nlist)?;
+        self.validate_shape()?;
         ensure_certified_metric(self.band.metric())?;
-        match self.width {
-            RangeSearchWidth::Fixed { nprobe } => Ok(nprobe.min(nlist)),
-            RangeSearchWidth::Auto { .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "RangeSearchWidth::Auto is not implemented yet",
-            )),
-        }
+        Ok(self.nprobe.min(nlist))
     }
 }
 
@@ -1066,7 +970,7 @@ mod tests {
         assert_eq!(result.query(0).labels, &[10, 11]);
         assert_eq!(result.query(0).distances, &[1.5, 2.5]);
         assert_eq!(result.query(1).labels, &[20]);
-        assert!(!result.query(1).limit_reached);
+        assert_eq!(result.query(1).distances, &[3.5]);
     }
 
     #[test]
@@ -1133,20 +1037,5 @@ mod tests {
                 "nprobe == 0 on metric {metric:?}"
             );
         }
-    }
-
-    #[test]
-    fn auto_width_is_unsupported_until_the_caps_land() {
-        let params = VectorRangeSearchParams::new(l2_band_for_params(), 8).with_width(
-            RangeSearchWidth::Auto {
-                initial: 8,
-                growth_factor: 2,
-                max_width: 64,
-            },
-        );
-        assert_eq!(
-            params.validate(1024).unwrap_err().kind(),
-            std::io::ErrorKind::Unsupported
-        );
     }
 }

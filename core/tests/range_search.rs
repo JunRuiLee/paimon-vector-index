@@ -30,9 +30,7 @@ use paimon_vindex_core::index::{VectorIndexReader, VectorSearchParams};
 use paimon_vindex_core::io::PosWriter;
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
 use paimon_vindex_core::ivfflat_io::write_ivfflat_index;
-use paimon_vindex_core::range::{
-    Bound, DistanceBand, QueryResult, RangeSearchWidth, VectorRangeSearchParams,
-};
+use paimon_vindex_core::range::{Bound, DistanceBand, QueryResult, VectorRangeSearchParams};
 use std::collections::HashSet;
 use std::io::Cursor;
 
@@ -409,18 +407,6 @@ fn an_unsupported_index_type_fails_loud_for_every_band() {
     let err = reader
         .range_search(&[0.0; 8], VectorRangeSearchParams::new(empty, 4))
         .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-}
-
-#[test]
-fn an_auto_width_is_rejected_as_unsupported() {
-    let (mut reader, ..) = build_flat_fixture(64, 8, 4);
-    let params = VectorRangeSearchParams::new(l2(0.0, 1.0), 4).with_width(RangeSearchWidth::Auto {
-        initial: 2,
-        growth_factor: 2,
-        max_width: 4,
-    });
-    let err = reader.range_search(&[0.0; 8], params).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
 }
 
@@ -866,6 +852,83 @@ fn the_l2_cutoff_does_not_change_which_rows_are_returned() {
 }
 
 #[test]
+fn early_abandoned_counts_exactly_the_rows_above_the_upper_cut() {
+    // `early_abandoned` is a published statistic, and what it counts is decided
+    // by the abandon cutoff. That cutoff is now the raw upper cut, so the set is
+    // exactly stateable rather than merely bounded: the scan abandons a row when
+    // its running sum passes `upper`, and a partial sum of non-negative terms
+    // only grows, so the completed distance passes it too. Conversely a row
+    // above `upper` fails the check on its completed sum at the latest. Hence
+    // abandoned <=> distance > upper, and this asserts that equality instead of
+    // the `> 0` the neighbouring tests settle for.
+    //
+    // The three-way split it implies is the real content: rows above the cut
+    // never reach the band test, rows *on* the cut do reach it and are rejected
+    // there (the interval is half-open), and rows below `lower` reach it too.
+    // Only the first group is counted here.
+    const NLIST: usize = 8;
+    // d = 256 spans two probe strides, so a row can fail the cutoff part way
+    // through its vector rather than only on the completed sum. Both exits go
+    // through the same `note_abandoned` call, and nothing observable from here
+    // distinguishes them, so this widens what the fixture covers rather than
+    // letting the count be asserted only for the simpler exit.
+    let (mut reader, vectors, ids, d) = build_flat_fixture(256, 256, NLIST);
+    let query = vectors[0..d].to_vec();
+
+    let distances: Vec<f32> = (0..ids.len())
+        .map(|row| fvec_l2sqr(&query, &vectors[row * d..(row + 1) * d]))
+        .collect();
+    let mut sorted = distances.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("distances are finite"));
+
+    // A lower cut above the nearest rows, so the "rejected but not abandoned"
+    // group is non-empty; an upper cut mid-corpus, so the abandoned group is
+    // non-empty and a row sits exactly on it.
+    let lower = sorted[ids.len() / 8];
+    let upper = sorted[ids.len() / 2];
+    let band = DistanceBand::new(Bound::Finite(lower), Bound::Finite(upper), MetricType::L2)
+        .expect("a well-ordered band");
+
+    // nprobe = nlist, so every row is probed and the expected counts are over
+    // the whole corpus rather than over an unknown probed subset.
+    let result = reader
+        .range_search(&query, VectorRangeSearchParams::new(band, NLIST))
+        .unwrap();
+    let stats = result.query(0).stats;
+
+    let above = distances.iter().filter(|value| **value > upper).count();
+    let on_the_cut = distances.iter().filter(|value| **value == upper).count();
+    let below_lower = distances.iter().filter(|value| **value < lower).count();
+    let in_band = distances
+        .iter()
+        .filter(|value| **value >= lower && **value < upper)
+        .count();
+
+    // Each group must be populated, or the equalities below hold vacuously.
+    assert!(above > 0 && below_lower > 0 && in_band > 0);
+    assert_eq!(
+        on_the_cut, 1,
+        "the cut is a row's own distance by construction"
+    );
+
+    assert_eq!(
+        stats.early_abandoned(),
+        above,
+        "early_abandoned must be exactly the rows above the upper cut"
+    );
+    assert_eq!(stats.rows_scanned(), ids.len());
+    assert_eq!(stats.rows_committed(), in_band);
+    // The rows the cutoff let through: everything at or below `upper`, whether
+    // the band then admits it or not. A row *on* the cut is in this group, which
+    // is what distinguishes the raw cut from one nudged even a single ULP.
+    assert_eq!(
+        stats.rows_scanned() - stats.early_abandoned(),
+        ids.len() - above,
+        "a row sitting on the cut must reach the band test, not be abandoned"
+    );
+}
+
+#[test]
 fn batch_stats_are_per_query_and_shared_lists_are_counted_once() {
     let (mut reader, queries, d) = build_asymmetric_fixture();
     let band = l2(0.0, 0.25);
@@ -896,7 +959,6 @@ fn batch_stats_are_per_query_and_shared_lists_are_counted_once() {
             st.rows_committed(),
             st.early_abandoned(),
             st.lists_probed(),
-            st.stop_reason(),
         )
     };
     let singles: Vec<_> = (0..2)
@@ -982,23 +1044,20 @@ fn stats_report_real_work() {
         "rows_scanned includes rejected and early-abandoned rows, so it cannot be smaller"
     );
     assert!(stats.early_abandoned() <= stats.rows_scanned());
-    assert_eq!(
-        stats.stop_reason(),
-        paimon_vindex_core::range::StopReason::Exhausted
-    );
     assert_eq!(result.call_stats().list_reads(), 4);
 }
 
 #[test]
 fn early_abandon_keeps_rows_just_inside_the_upper_cut() {
-    // Regression guard for a real defect: the early-abandon kernel
-    // (`fvec_l2sqr_scaled_exceeds`) reduces 128-element blocks into a scalar
-    // running total across four accumulators, while the committed-distance
-    // kernel (`fvec_l2sqr`) reduces once (two accumulators on NEON, one on
-    // AVX2). Their sums
-    // differ by a few ULP once d >= 128, so an unwidened cutoff abandoned rows
-    // that are genuinely in band: measured 1.24% of boundary rows at d=128,
-    // 1.65% at d=256 and 6.06% at d=768.
+    // Regression guard for a real defect. Pruning and committing used to be two
+    // kernels: one reduced 128-element blocks into a scalar running total across
+    // four accumulators, the other reduced once (two accumulators on NEON, one on
+    // AVX2). Their sums differ by a few ULP once d >= 128, so a row genuinely in
+    // band could be abandoned -- measured 1.24% of boundary rows at d=128, 1.65%
+    // at d=256 and 6.06% at d=768. `fvec_l2sqr_unless_exceeds` now prunes against
+    // the accumulation it commits, so there is no divergence to cover and the cut
+    // is used raw. Restoring the two-kernel scan while keeping the raw cut makes
+    // this test fail, which is what makes it a guard rather than a formality.
     //
     // The trigger is narrow, so the test has to aim at it precisely: for each
     // probed row, put the upper cut exactly one ULP **above that row's own
@@ -1038,7 +1097,7 @@ fn early_abandon_keeps_rows_just_inside_the_upper_cut() {
         assert!(
             returned.contains(&id),
             "row {id} at distance {distance:?} is inside [0, {upper:?}) but was dropped; \
-             the early-abandon threshold is not widened enough"
+             pruning and committing have diverged again"
         );
         // And the whole result must still agree with the oracle exactly.
         assert_eq!(
@@ -1054,8 +1113,8 @@ fn early_abandon_keeps_rows_just_inside_the_upper_cut() {
 #[test]
 fn a_row_exactly_on_the_upper_cut_is_excluded() {
     // The half-open interval's other edge. This is a membership property rather
-    // than an early-abandon one: widening the abandon threshold must not turn an
-    // exclusion into an inclusion.
+    // than an early-abandon one: the cut is exclusive, and pruning at that same
+    // value must not turn the exclusion into an inclusion.
     const D: usize = 768;
     let (mut reader, vectors, ids, d) = build_flat_fixture(256, D, 4);
     let query = vectors[0..d].to_vec();
@@ -1209,83 +1268,26 @@ fn a_caller_bug_outranks_an_unsupported_family() {
 }
 
 #[test]
-fn a_malformed_auto_width_is_invalid_input_not_unsupported() {
-    // Automatic width is not implemented, but malformed field values are still a
-    // caller bug and must not be masked by the capability gap.
-    let (mut reader, ..) = build_flat_fixture(64, 8, 4);
-    let band = l2(0.0, 1.0);
-    for (width, what) in [
-        (
-            RangeSearchWidth::Auto {
-                initial: 0,
-                growth_factor: 2,
-                max_width: 4,
-            },
-            "initial == 0",
-        ),
-        (
-            RangeSearchWidth::Auto {
-                initial: 2,
-                growth_factor: 1,
-                max_width: 4,
-            },
-            "growth_factor < 2",
-        ),
-        (
-            RangeSearchWidth::Auto {
-                initial: 2,
-                growth_factor: 2,
-                max_width: 0,
-            },
-            "max_width == 0",
-        ),
-    ] {
-        let params = VectorRangeSearchParams::new(band, 4).with_width(width);
-        let err = reader.range_search(&[0.0; 8], params).unwrap_err();
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::InvalidInput,
-            "{what} must be InvalidInput"
-        );
-    }
-    // The clamp-dependent rule: with nlist = 4, `initial = 8` clamps to 4 while
-    // `max_width = 2` stays 2, so the pair is contradictory only after clamping.
-    // Comparing before clamping would let this through.
-    let params = VectorRangeSearchParams::new(band, 4).with_width(RangeSearchWidth::Auto {
-        initial: 8,
-        growth_factor: 2,
-        max_width: 2,
-    });
-    let err = reader.range_search(&[0.0; 8], params).unwrap_err();
-    assert_eq!(
-        err.kind(),
-        std::io::ErrorKind::InvalidInput,
-        "max_width below initial after clamping is a caller bug"
-    );
-
-    // And it must outrank the metric capability gap, not hide behind it.
+fn a_zero_nprobe_outranks_the_metric_capability_gap() {
+    // Two gates can reject the same call, and the order is observable: an FFI
+    // caller reading `Unsupported` as "fall back to a scan" would silently paper
+    // over a zero nprobe if the metric gap were reported first.
     let (mut cosine_reader, ..) = build_flat_fixture_with_metric(64, 8, 4, MetricType::Cosine);
     let cosine_band =
         DistanceBand::new(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::Cosine).unwrap();
-    let params = VectorRangeSearchParams::new(cosine_band, 4).with_width(RangeSearchWidth::Auto {
-        initial: 8,
-        growth_factor: 2,
-        max_width: 2,
-    });
-    let err = cosine_reader.range_search(&[0.0; 8], params).unwrap_err();
+    let err = cosine_reader
+        .range_search(&[0.0; 8], VectorRangeSearchParams::new(cosine_band, 0))
+        .unwrap_err();
     assert_eq!(
         err.kind(),
         std::io::ErrorKind::InvalidInput,
-        "the clamp rule must be checked before the metric capability gap"
+        "nprobe == 0 must be reported before the uncertified-metric gap"
     );
 
-    // A well-formed Auto is still a capability gap.
-    let params = VectorRangeSearchParams::new(band, 4).with_width(RangeSearchWidth::Auto {
-        initial: 2,
-        growth_factor: 2,
-        max_width: 4,
-    });
-    let err = reader.range_search(&[0.0; 8], params).unwrap_err();
+    // With a valid nprobe the metric gap is what is left to report.
+    let err = cosine_reader
+        .range_search(&[0.0; 8], VectorRangeSearchParams::new(cosine_band, 4))
+        .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
 }
 
@@ -1390,39 +1392,36 @@ fn an_oversized_list_streams_and_still_matches_the_oracle() {
 
 #[test]
 fn early_abandon_survives_intermediate_underflow() {
-    // The threshold carries an additive term because a normal cut does not stop
-    // the individual squared terms from landing in the subnormal range, where a
-    // rounding carries absolute rather than relative error. Every other test in
-    // this file works at ordinary magnitudes and never enters that regime.
+    // A normal cut does not stop the individual squared terms from landing in
+    // the subnormal range, where a rounding carries absolute rather than
+    // relative error. Every other test in this file works at ordinary
+    // magnitudes and never enters that regime.
     //
-    // Reaching it needs care, and two earlier attempts at this test missed.
-    // The first perturbed 1.0 by 1e-24, far below half an ULP at 1.0, so every
-    // coordinate rounded back to exactly 1.0 and every distance was zero. The
-    // second offset a base by whole ULPs, which makes the difference an exact
-    // power of two -- subnormal, but squaring a power of two is exact, so it
-    // still produced no rounding at all. Both passed against any threshold,
+    // Pruning and committing are one accumulation, so a rounding that happens
+    // happens once and to both. This checks that the claim survives where it is
+    // least comfortable: the monotonicity argument holds for gradual underflow
+    // too -- adding a non-negative subnormal is still non-decreasing -- but
+    // "still true in the subnormal range" is worth a fixture rather than a
+    // sentence.
+    //
+    // Reaching the regime needs care, and two earlier attempts at this test
+    // missed. The first perturbed 1.0 by 1e-24, far below half an ULP at 1.0, so
+    // every coordinate rounded back to exactly 1.0 and every distance was zero.
+    // The second offset a base by whole ULPs, which makes the difference an
+    // exact power of two -- subnormal, but squaring a power of two is exact, so
+    // it still produced no rounding at all. Both passed against any threshold,
     // including zero. So this version asserts the regime it needs rather than
     // assuming it: subnormal *and* inexact.
-    //
-    // What this covers, and what it does not. It is the end-to-end check that
-    // the regime is survivable: real subnormal roundings, a boundary-tight cut,
-    // and no in-band row lost. It does not pin down the size of the widening.
-    // At d = 256 the whole threshold is only 1.000032x the cut, the additive
-    // term is 16 ULPs of it, and the fixture still passes with the entire
-    // excess removed -- so this test cannot tell a correct margin from a
-    // missing one. The arithmetic unit test
-    // `the_widening_margin_dominates_the_summation_error_bound` is what does
-    // that; its d = 4095 case catches an under-amplified `A`.
     const D: usize = 256;
     const ROWS: usize = 64;
 
     // Coordinates sit at or just above 2^-65, so a square lands in
     // [2^-130, 2^-128). That is deep enough into the subnormal range that the
     // result keeps about 19 bits rather than 24, so squaring a full 24-bit
-    // mantissa has to round -- which is exactly the error `A` exists to bound,
-    // on AVX2 in the multiply and on NEON in the fused multiply-add. 256 such
-    // terms sum back to ~4e-37, which is normal, so the band comparison itself
-    // is ordinary arithmetic.
+    // mantissa has to round -- in the multiply on both AVX2 and NEON, neither of
+    // which fuses it (`vmlaq_f32` is a separate multiply and add; `vfmaq_f32` is
+    // the fused one). 256 such terms sum back to ~4e-37, which is normal, so the
+    // band comparison itself is ordinary arithmetic.
     fn coordinate(row: usize, dim: usize) -> f32 {
         let scatter =
             (row as u32).wrapping_mul(2_654_435_761) ^ (dim as u32).wrapping_mul(2_246_822_519);
@@ -1478,7 +1477,7 @@ fn early_abandon_survives_intermediate_underflow() {
     // Cut at the median, so the tightest excluded row sits exactly on the cut
     // and the tightest retained row is a hair below it. Pruning has to make its
     // decision right at the boundary, in the regime asserted above, which is
-    // where too narrow a threshold would drop a row it must keep.
+    // where a prune diverging from the commit would drop a row it must keep.
     let cut = sorted[ROWS / 2];
     let nearest_kept = sorted[ROWS / 2 - 1];
     assert!(
