@@ -926,15 +926,28 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             }
         }
 
-        // Per-query output buckets. The whole batch of (list, query) results is
+        // Per-query merge buckets. The whole batch of (list, query) results is
         // deliberately **not** materialized and merged afterwards: unlike a
         // top-K local heap, a range collector has no upper bound, so that shape
         // would hold O(B x Q x hits) resident at once. Each (list, query) task
         // holds only that list's hits and takes the lock once to merge them.
-        let outputs: Vec<Mutex<Vec<(i64, f32)>>> =
-            (0..nq).map(|_| Mutex::new(Vec::new())).collect();
-        let tallies: Vec<Mutex<(usize, usize)>> = // (scanned, early_abandoned)
-            (0..nq).map(|_| Mutex::new((0, 0))).collect();
+        #[derive(Default)]
+        struct QueryMerge {
+            rows: Vec<(i64, f32)>,
+            scanned: usize,
+            early_abandoned: usize,
+        }
+        let query_merges: Vec<Mutex<QueryMerge>> =
+            (0..nq).map(|_| Mutex::new(QueryMerge::default())).collect();
+        let merge_collector = |qi: usize, collector: RangeCollector| {
+            let scanned = collector.scanned();
+            let early_abandoned = collector.early_abandoned();
+            let rows = collector.into_rows();
+            let mut output = query_merges[qi].lock().expect("output lock");
+            output.scanned += scanned;
+            output.early_abandoned += early_abandoned;
+            output.rows.extend(rows);
+        };
 
         let mut batch_start = 0usize;
         while batch_start < unique_lists.len() {
@@ -952,13 +965,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                         let q = &queries[qi * d..(qi + 1) * d];
                         let mut collector = RangeCollector::new(band);
                         scan_flat_rows(q, ids, vectors, d, metric, filter, &mut collector)?;
-                        let mut tally = tallies[qi].lock().expect("tally lock");
-                        tally.0 += collector.scanned();
-                        tally.1 += collector.early_abandoned();
-                        outputs[qi]
-                            .lock()
-                            .expect("output lock")
-                            .extend(collector.into_rows());
+                        merge_collector(qi, collector);
                     }
                     Ok(())
                 })?;
@@ -986,13 +993,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 let q = &queries[qi * d..(qi + 1) * d];
                 let mut collector = RangeCollector::new(band);
                 scan_flat_list(q, list, d, metric, filter, &mut collector)?;
-                let mut tally = tallies[qi].lock().expect("tally lock");
-                tally.0 += collector.scanned();
-                tally.1 += collector.early_abandoned();
-                outputs[qi]
-                    .lock()
-                    .expect("output lock")
-                    .extend(collector.into_rows());
+                merge_collector(qi, collector);
                 Ok(())
             };
             // The parallel threshold is identical to the top-K path's.
@@ -1019,10 +1020,10 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
         // `mem::take` gives the Vec's ownership to the builder, leaving the peak
         // only one final CSR larger.
         for qi in 0..nq {
-            let (scanned, abandoned) = *tallies[qi].lock().expect("tally lock");
-            builder.record_scanned(qi, scanned);
-            builder.record_early_abandoned(qi, abandoned);
-            let rows = std::mem::take(&mut *outputs[qi].lock().expect("output lock"));
+            let mut output = query_merges[qi].lock().expect("output lock");
+            builder.record_scanned(qi, output.scanned);
+            builder.record_early_abandoned(qi, output.early_abandoned);
+            let rows = std::mem::take(&mut output.rows);
             builder.take_rows(qi, rows);
         }
         Ok(builder.build())
