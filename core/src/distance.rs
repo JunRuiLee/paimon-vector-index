@@ -262,14 +262,29 @@ fn fvec_l2sqr_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn fvec_l2sqr_unless_exceeds_scalar(a: &[f32], b: &[f32], threshold: f32) -> Option<f32> {
     let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        let d = a[i] - b[i];
-        sum += d * d;
+    let mut i = 0;
+    while i + L2_PROBE_STRIDE < a.len() {
+        let block_end = i + L2_PROBE_STRIDE;
+        while i < block_end {
+            let d = a[i] - b[i];
+            sum += d * d;
+            i += 1;
+        }
         if sum > threshold {
             return None;
         }
     }
-    Some(sum)
+
+    while i < a.len() {
+        let d = a[i] - b[i];
+        sum += d * d;
+        i += 1;
+    }
+    if sum > threshold {
+        None
+    } else {
+        Some(sum)
+    }
 }
 
 #[cfg(any(
