@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::collect::{Collector, RangeCollector};
-use crate::distance::{fvec_l2sqr, fvec_norm_l2sqr, preprocess_vectors, MetricType};
+use crate::distance::{fvec_norm_l2sqr, preprocess_vectors, MetricType};
 use crate::index::validate_queries;
 use crate::index_io_util::{
     decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_payloads,
@@ -709,30 +709,18 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         let probe_lists = queries
             .par_chunks_exact(self.d)
             .map(|query| {
-                let mut distances = self
-                    .quantizer_centroids
-                    .chunks_exact(self.d)
-                    .enumerate()
-                    .map(|(list_id, centroid)| {
-                        let distance = fvec_l2sqr(query, centroid);
-                        if !distance.is_finite() {
-                            return Err(invalid_data(format!(
-                                "non-finite IVF-RQ query-centroid distance for list {list_id}"
-                            )));
-                        }
-                        Ok((list_id, distance))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                let compare = |left: &(usize, f32), right: &(usize, f32)| {
-                    left.1.total_cmp(&right.1).then(left.0.cmp(&right.0))
-                };
-                if nprobe < distances.len() {
-                    distances.select_nth_unstable_by(nprobe - 1, compare);
-                    distances.truncate(nprobe);
-                    distances.shrink_to_fit();
-                }
-                distances.sort_unstable_by(compare);
-                Ok(distances)
+                kmeans::find_topk_checked(
+                    query,
+                    &self.quantizer_centroids,
+                    self.nlist,
+                    self.d,
+                    nprobe,
+                )
+                .map_err(|list_id| {
+                    invalid_data(format!(
+                        "non-finite IVF-RQ query-centroid distance for list {list_id}"
+                    ))
+                })
             })
             .collect::<io::Result<Vec<_>>>()?;
         let mut query_contexts = Vec::with_capacity(nq);
@@ -749,7 +737,7 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         let mut unique_lists = Vec::new();
         for (query_index, lists) in probe_lists.iter().enumerate() {
             builder.record_lists_probed(query_index, lists.len());
-            for &(list_id, distance) in lists {
+            for &(distance, list_id) in lists {
                 if list_to_queries[list_id].is_empty() {
                     unique_lists.push(list_id);
                 }

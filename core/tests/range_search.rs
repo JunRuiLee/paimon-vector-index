@@ -178,6 +178,56 @@ fn rq_all_distances() -> DistanceBand {
 }
 
 #[test]
+fn rq_range_bounded_probes_match_oracle_across_many_lists() {
+    let index = rq_fixture(13, 4, 65, 3);
+    let queries = [0.2, 126.0, 256.2]
+        .into_iter()
+        .flat_map(|base| (0..index.d).map(move |dimension| base + dimension as f32 * 0.01))
+        .collect::<Vec<_>>();
+    let allowed = index
+        .ids
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|row| row % 2 == 0)
+        .collect::<HashSet<_>>();
+    let filter = serialize_roaring(&allowed);
+    for width in [1, 3, 16, 33, 65, usize::MAX] {
+        let nprobe = width.min(index.nlist);
+        for band in [rq_all_distances(), l2(0.0, 256.0)] {
+            let params = VectorRangeSearchParams::new(band, width);
+            let mut reader = rq_reader(&index);
+            let batch = reader.range_search_batch(&queries, 3, params).unwrap();
+            let filtered = reader
+                .range_search_batch_with_roaring_filter(&queries, 3, params, &filter)
+                .unwrap();
+            for (query_index, query) in queries.chunks_exact(index.d).enumerate() {
+                let expected = rq_estimated_oracle(&index, query, nprobe)
+                    .into_iter()
+                    .filter(|row| band.admit(row.1))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    pairs_of(batch.query(query_index)),
+                    bits_of(expected.clone())
+                );
+                let single = reader.range_search(query, params).unwrap();
+                assert_eq!(pairs_of(single.query(0)), bits_of(expected.clone()));
+                assert_eq!(
+                    pairs_of(filtered.query(query_index)),
+                    bits_of(
+                        expected
+                            .into_iter()
+                            .filter(|row| allowed.contains(&row.0))
+                            .collect()
+                    )
+                );
+                assert_eq!(batch.query(query_index).stats.rows_scanned(), nprobe * 3);
+            }
+        }
+    }
+}
+
+#[test]
 fn rq_range_batch_single_filters_and_statistics_agree() {
     for bits in [1, 4, 8] {
         let index = rq_fixture(256, bits, 4, 37);
@@ -499,26 +549,28 @@ fn rq_range_rejects_overflow_in_an_unselected_centroid() {
     use paimon_vindex_core::ivfrq_io::IVF_RQ_HEADER_SIZE;
     use std::io::ErrorKind;
 
-    let index = rq_fixture(13, 4, 2, 37);
-    let mut bytes = rq_bytes(&index);
-    let offset = IVF_RQ_HEADER_SIZE + index.d * 4;
-    bytes[offset..offset + 4].copy_from_slice(&1e20f32.to_le_bytes());
-    let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
-    let params = VectorRangeSearchParams::new(rq_all_distances(), 1);
-    let query = vec![0.0; index.d];
-    let queries = query.repeat(2);
-    let filter = serialize_roaring(&index.ids[0].iter().copied().collect());
-    for error in [
-        reader.range_search(&query, params).unwrap_err(),
-        reader.range_search_batch(&queries, 2, params).unwrap_err(),
-        reader
-            .range_search_with_roaring_filter(&query, params, &filter)
-            .unwrap_err(),
-        reader
-            .range_search_batch_with_roaring_filter(&queries, 2, params, &filter)
-            .unwrap_err(),
-    ] {
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    for nlist in [2, 65] {
+        let index = rq_fixture(13, 4, nlist, 37);
+        let mut bytes = rq_bytes(&index);
+        let offset = IVF_RQ_HEADER_SIZE + (nlist - 1) * index.d * 4;
+        bytes[offset..offset + 4].copy_from_slice(&1e20f32.to_le_bytes());
+        let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
+        let params = VectorRangeSearchParams::new(rq_all_distances(), 1);
+        let query = vec![0.0; index.d];
+        let queries = query.repeat(2);
+        let filter = serialize_roaring(&index.ids[0].iter().copied().collect());
+        for error in [
+            reader.range_search(&query, params).unwrap_err(),
+            reader.range_search_batch(&queries, 2, params).unwrap_err(),
+            reader
+                .range_search_with_roaring_filter(&query, params, &filter)
+                .unwrap_err(),
+            reader
+                .range_search_batch_with_roaring_filter(&queries, 2, params, &filter)
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+        }
     }
 }
 
