@@ -1537,6 +1537,52 @@ mod tests {
     }
 
     #[test]
+    fn test_find_topk_batch_selection_does_not_depend_on_batch_size() {
+        // Range search promises a query returns the same rows whether it runs
+        // alone or in a batch, and it selects its probe lists with this helper,
+        // so the selection must not vary with `nq`. `nq == 1` takes the direct
+        // `find_topk` path while `nq > 1` goes through SGEMM plus boundary
+        // refinement, which is where the two could diverge.
+        const BASE: f32 = 1.0e9;
+        let centroids = vec![BASE + 128.0, BASE + 64.0];
+        let query = BASE;
+
+        // Assert the regime: at this magnitude the norm identity
+        // ||q||^2 + ||c||^2 - 2q.c cancels catastrophically. Without the
+        // refinement step the reconstructed distances collapse to a tie that
+        // index order breaks toward centroid 0 -- the *farther* one, whose true
+        // distance is 16384 against centroid 1's 4096. A fixture that did not
+        // reproduce this would make the assertions below vacuous.
+        let reconstructed = centroids
+            .iter()
+            .map(|&c| query * query + c * c - 2.0 * query * c)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reconstructed[0], reconstructed[1],
+            "fixture is not adversarial: norm reconstruction must collapse both \
+             centroids to the same value for this test to mean anything"
+        );
+        assert!(
+            (query - centroids[0]).powi(2) > (query - centroids[1]).powi(2),
+            "fixture is not adversarial: centroid 1 must be the genuinely nearer one"
+        );
+
+        let alone = find_topk_batch(&[query], 1, &centroids, 2, 1, 1);
+        let batched = find_topk_batch(&[query, BASE + 64.0], 2, &centroids, 2, 1, 1);
+
+        assert_eq!(
+            alone.0[0],
+            vec![1],
+            "the direct path must select the genuinely nearer centroid"
+        );
+        assert_eq!(
+            (batched.0[0].clone(), batched.1[0].clone()),
+            (alone.0[0].clone(), alone.1[0].clone()),
+            "batching changed the selected centroid or its distance"
+        );
+    }
+
+    #[test]
     fn test_find_topk_batch_matches_scalar_for_non_finite_values() {
         for (queries, centroids) in [
             (
