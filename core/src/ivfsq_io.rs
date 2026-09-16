@@ -862,7 +862,9 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                 self.for_each_streamed_list_chunk(first_list, |ids, codes| {
                     let masks = filter.map(|filter| sq_filter_masks(ids, filter));
                     let selection = SqRowSelection::from_masks(masks.as_deref());
-                    for &query_index in &list_to_queries[first_list] {
+                    let query_indices = &list_to_queries[first_list];
+                    if query_indices.len() == 1 {
+                        let query_index = query_indices[0];
                         scan_sq_rows(
                             &queries[query_index * dimension..(query_index + 1) * dimension],
                             ids,
@@ -874,6 +876,24 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                             &mut scratch,
                             &mut collectors[query_index],
                         )?;
+                    } else {
+                        let mut chunk_collectors = query_indices
+                            .iter()
+                            .map(|&query_index| (query_index, RangeCollector::new(band)))
+                            .collect::<Vec<_>>();
+                        scan_sq_range_chunk(
+                            queries,
+                            ids,
+                            codes,
+                            &centroid,
+                            &sq,
+                            selection,
+                            &mut scratch,
+                            &mut chunk_collectors,
+                        )?;
+                        for (query_index, collector) in chunk_collectors {
+                            collectors[query_index].merge(collector);
+                        }
                     }
                     Ok(())
                 })?;
@@ -1324,6 +1344,44 @@ fn sq_filter_masks(ids: &[i64], filter: &dyn RowIdFilter) -> Vec<u32> {
 // small indexes stay on the lower-overhead sequential path.
 const PARALLEL_SQ_SCAN_MIN_CANDIDATES: usize = 8 * 1024;
 
+fn scan_sq_range_chunk<C: Collector + Send>(
+    queries: &[f32],
+    ids: &[i64],
+    codes: &[u8],
+    centroid: &[f32],
+    sq: &ScalarQuantizer,
+    selection: SqRowSelection<'_>,
+    scratch: &mut SqScanScratch,
+    collectors: &mut [(usize, C)],
+) -> io::Result<()> {
+    let dimension = centroid.len();
+    let scan_query = |scratch: &mut SqScanScratch, (query_index, collector): &mut (usize, C)| {
+        scan_sq_rows(
+            &queries[*query_index * dimension..(*query_index + 1) * dimension],
+            ids,
+            codes,
+            centroid,
+            sq,
+            MetricType::L2,
+            selection,
+            scratch,
+            collector,
+        )
+    };
+    if collectors.len() > 1
+        && ids.len().saturating_mul(collectors.len()) >= PARALLEL_SQ_SCAN_MIN_CANDIDATES
+    {
+        collectors
+            .par_iter_mut()
+            .try_for_each_init(SqScanScratch::default, scan_query)?;
+    } else {
+        for collector in collectors {
+            scan_query(scratch, collector)?;
+        }
+    }
+    Ok(())
+}
+
 fn scan_sq_list<C: Collector>(
     query: &[f32],
     list: &SqListData,
@@ -1593,6 +1651,143 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn ivfsq_range_streamed_chunk_scans_queries_on_multiple_workers() {
+        struct TrackingCollector<'a> {
+            inner: RangeCollector,
+            workers: &'a AtomicU64,
+        }
+
+        impl Collector for TrackingCollector<'_> {
+            fn cutoff(&self) -> f32 {
+                let worker = rayon::current_thread_index().unwrap();
+                self.workers.fetch_or(1 << worker, Ordering::Relaxed);
+                self.inner.cutoff()
+            }
+
+            fn push(&mut self, id: i64, value: f32) -> io::Result<()> {
+                self.inner.push(id, value)
+            }
+
+            fn note_abandoned(&mut self) {
+                self.inner.note_abandoned();
+            }
+        }
+
+        let dimension = 65;
+        let count = 8_193;
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let codes = vec![0; count * dimension];
+        let centroid = vec![0.0; dimension];
+        let sq = ScalarQuantizer::with_bounds(dimension, 0.0, 1.0);
+        let queries = (0..16)
+            .flat_map(|query_index| vec![query_index as f32 * 0.25; dimension])
+            .collect::<Vec<_>>();
+        let band =
+            DistanceBand::new(Bound::Finite(1.0), Bound::Finite(200.0), MetricType::L2).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let allowed: RoaringTreemap = (0..count as u64).filter(|id| id % 3 == 0).collect();
+        let masks = sq_filter_masks(&ids, &allowed);
+        for selection in [
+            SqRowSelection::Filter(None),
+            SqRowSelection::BlockMasks(&masks),
+        ] {
+            let workers = AtomicU64::new(0);
+            let query_indices = [14, 2, 12, 4, 10, 6, 8, 0];
+            let mut collectors = query_indices
+                .iter()
+                .map(|&query_index| {
+                    (
+                        query_index,
+                        TrackingCollector {
+                            inner: RangeCollector::new(band),
+                            workers: &workers,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            pool.install(|| {
+                scan_sq_range_chunk(
+                    &queries,
+                    &ids,
+                    &codes,
+                    &centroid,
+                    &sq,
+                    selection,
+                    &mut SqScanScratch::default(),
+                    &mut collectors,
+                )
+                .unwrap();
+            });
+            assert!(
+                workers.load(Ordering::Relaxed).count_ones() > 1,
+                "streamed chunks must scan active queries on multiple Rayon workers"
+            );
+            for (query_index, collector) in collectors {
+                let mut expected = RangeCollector::new(band);
+                scan_sq_rows(
+                    &queries[query_index * dimension..(query_index + 1) * dimension],
+                    &ids,
+                    &codes,
+                    &centroid,
+                    &sq,
+                    MetricType::L2,
+                    selection,
+                    &mut SqScanScratch::default(),
+                    &mut expected,
+                )
+                .unwrap();
+                assert_eq!(collector.inner.scanned(), expected.scanned());
+                assert_eq!(
+                    collector.inner.early_abandoned(),
+                    expected.early_abandoned()
+                );
+                assert_eq!(collector.inner.into_rows(), expected.into_rows());
+            }
+        }
+    }
+
+    #[test]
+    fn ivfsq_range_streamed_chunk_propagates_parallel_collector_failure() {
+        struct FailingCollector;
+
+        impl Collector for FailingCollector {
+            fn cutoff(&self) -> f32 {
+                f32::INFINITY
+            }
+
+            fn push(&mut self, _id: i64, _value: f32) -> io::Result<()> {
+                Err(io::Error::other("parallel collector failed"))
+            }
+        }
+
+        let ids = (0..4_097).collect::<Vec<_>>();
+        let codes = vec![0; ids.len()];
+        let sq = ScalarQuantizer::with_bounds(1, 0.0, 1.0);
+        let error = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_sq_range_chunk(
+                    &[0.0, 1.0],
+                    &ids,
+                    &codes,
+                    &[0.0],
+                    &sq,
+                    SqRowSelection::Filter(None),
+                    &mut SqScanScratch::default(),
+                    &mut [(0, FailingCollector), (1, FailingCollector)],
+                )
+                .unwrap_err()
+            });
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "parallel collector failed");
+    }
 
     #[test]
     fn ivfsq_range_batch_evaluates_filter_once_per_list_row() {

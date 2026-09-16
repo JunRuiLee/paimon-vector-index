@@ -1325,58 +1325,64 @@ fn ivf_sq_range_streams_oversized_lists_for_single_batch_and_filter() {
     let mut queries = vec![0.0; dimension];
     queries.extend(vec![0.25; dimension]);
     let params = VectorRangeSearchParams::new(l2(0.0, 1.0), 1);
-    *trace.lock().unwrap() = SqReadTrace::default();
-    let result = reader.range_search_batch(&queries, 2, params).unwrap();
-    assert_eq!(result.call_stats().list_reads(), 1);
-    assert!(trace.lock().unwrap().calls > 2);
-    assert!(trace.lock().unwrap().max_bytes < count * dimension);
-    assert!(trace.lock().unwrap().max_bytes <= 64 * 1024 * 1024);
-    let mut first_ids: Vec<_> = (0..32).collect();
-    first_ids.push((count - 1) as i64);
-    assert_eq!(result.query(0).labels, first_ids);
-    assert_eq!(result.query(1).labels, (32..64).collect::<Vec<i64>>());
-    let allowed: HashSet<i64> = (0..count as i64).filter(|id| id % 2 == 0).collect();
-    let filter = serialize_roaring(&allowed);
-    let filtered = reader
-        .range_search_batch_with_roaring_filter(&queries, 2, params, &filter)
-        .unwrap();
-    for (query_index, query) in queries.chunks_exact(dimension).enumerate() {
-        assert_eq!(result.query(query_index).stats.rows_scanned(), count);
-        assert!(result.query(query_index).stats.early_abandoned() > count - 100);
-        let single = reader.range_search(query, params).unwrap();
-        assert_eq!(
-            pairs_of(single.query(0)),
-            pairs_of(result.query(query_index))
-        );
-        let expected: Vec<_> = pairs_of(result.query(query_index))
-            .into_iter()
-            .filter(|(id, _)| allowed.contains(id))
-            .collect();
-        assert_eq!(pairs_of(filtered.query(query_index)), expected);
-        assert_eq!(
-            pairs_of(
-                reader
-                    .range_search_with_roaring_filter(query, params, &filter)
-                    .unwrap()
-                    .query(0)
-            ),
-            expected
-        );
+    let mut check_streamed_queries = || {
+        *trace.lock().unwrap() = SqReadTrace::default();
+        let result = reader.range_search_batch(&queries, 2, params).unwrap();
+        assert_eq!(result.call_stats().list_reads(), 1);
+        assert!(trace.lock().unwrap().calls > 2);
+        assert!(trace.lock().unwrap().max_bytes < count * dimension);
+        assert!(trace.lock().unwrap().max_bytes <= 64 * 1024 * 1024);
+        let mut first_ids: Vec<_> = (0..32).collect();
+        first_ids.push((count - 1) as i64);
+        assert_eq!(result.query(0).labels, first_ids);
+        assert_eq!(result.query(1).labels, (32..64).collect::<Vec<i64>>());
+        let allowed: HashSet<i64> = (0..count as i64).filter(|id| id % 2 == 0).collect();
+        let filter = serialize_roaring(&allowed);
+        let filtered = reader
+            .range_search_batch_with_roaring_filter(&queries, 2, params, &filter)
+            .unwrap();
+        for (query_index, query) in queries.chunks_exact(dimension).enumerate() {
+            assert_eq!(result.query(query_index).stats.rows_scanned(), count);
+            assert!(result.query(query_index).stats.early_abandoned() > count - 100);
+            let single = reader.range_search(query, params).unwrap();
+            assert_eq!(
+                pairs_of(single.query(0)),
+                pairs_of(result.query(query_index))
+            );
+            let expected: Vec<_> = pairs_of(result.query(query_index))
+                .into_iter()
+                .filter(|(id, _)| allowed.contains(id))
+                .collect();
+            assert_eq!(pairs_of(filtered.query(query_index)), expected);
+            assert_eq!(
+                pairs_of(
+                    reader
+                        .range_search_with_roaring_filter(query, params, &filter)
+                        .unwrap()
+                        .query(0)
+                ),
+                expected
+            );
+        }
+    };
+    for threads in [1, 4] {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(&mut check_streamed_queries);
     }
 }
 
 #[test]
-fn ivf_sq_range_validates_all_entry_points_before_empty_band_shortcuts() {
+fn ivf_sq_range_batch_validates_inputs_before_empty_band_shortcuts() {
     use std::io::ErrorKind::{InvalidInput, Unsupported};
 
     for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
         let mut index = build_sq_index(33, 35, 2);
         index.metric = metric;
-        let bytes = serialize_sq(&index);
-        let mut unified = VectorIndexReader::open(Cursor::new(bytes.clone())).unwrap();
-        let mut direct = IVFSQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let mut reader = IVFSQIndexReader::open(Cursor::new(serialize_sq(&index))).unwrap();
         let empty = DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), metric).unwrap();
-        let valid_filter = serialize_roaring(&HashSet::new());
         let mismatched_metric = if metric == MetricType::L2 {
             MetricType::Cosine
         } else {
@@ -1384,126 +1390,60 @@ fn ivf_sq_range_validates_all_entry_points_before_empty_band_shortcuts() {
         };
         let mismatched =
             DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), mismatched_metric).unwrap();
-        for (queries, query_count, band, nprobe, filter, error) in [
-            (
-                vec![0.0; 32],
-                1,
-                empty,
-                2,
-                valid_filter.clone(),
-                Some(InvalidInput),
-            ),
-            (
-                vec![f32::NAN; 33],
-                1,
-                empty,
-                2,
-                valid_filter.clone(),
-                Some(InvalidInput),
-            ),
-            (
-                vec![f32::INFINITY; 33],
-                1,
-                empty,
-                2,
-                valid_filter.clone(),
-                Some(InvalidInput),
-            ),
-            (
-                vec![0.0; 33],
-                1,
-                empty,
-                0,
-                valid_filter.clone(),
-                Some(InvalidInput),
-            ),
-            (
-                vec![0.0; 33],
-                1,
-                mismatched,
-                2,
-                valid_filter.clone(),
-                Some(InvalidInput),
-            ),
-            (
-                vec![0.0; 33],
-                1,
-                empty,
-                2,
-                vec![0xde, 0xad],
-                Some(InvalidInput),
-            ),
-            (
-                vec![],
-                0,
-                empty,
-                2,
-                valid_filter.clone(),
-                Some(InvalidInput),
-            ),
-            (
-                vec![0.0; 33],
-                usize::MAX,
-                empty,
-                2,
-                valid_filter.clone(),
-                Some(InvalidInput),
-            ),
-            (
-                vec![0.0; 33],
-                1,
-                empty,
-                2,
-                valid_filter.clone(),
-                if metric == MetricType::L2 {
-                    None
-                } else {
-                    Some(Unsupported)
-                },
-            ),
+        let query = [0.0; 33];
+        for (case, queries, query_count, band, nprobe) in [
+            ("dimension", &query[..32], 1, empty, 2),
+            ("NaN", &[f32::NAN; 33], 1, empty, 2),
+            ("infinity", &[f32::INFINITY; 33], 1, empty, 2),
+            ("nprobe", &query, 1, empty, 0),
+            ("metric", &query, 1, mismatched, 2),
+            ("zero queries", &[], 0, empty, 2),
+            ("query count overflow", &query, usize::MAX, empty, 2),
         ] {
-            let params = VectorRangeSearchParams::new(band, nprobe);
-            for low_level in [false, true] {
-                for entry in 0..4 {
-                    if query_count != 1 && entry < 2 || filter != valid_filter && entry % 2 == 0 {
-                        continue;
-                    }
-                    let result = match (low_level, entry) {
-                        (false, 0) => unified.range_search(&queries, params),
-                        (false, 1) => {
-                            unified.range_search_with_roaring_filter(&queries, params, &filter)
-                        }
-                        (false, 2) => unified.range_search_batch(&queries, query_count, params),
-                        (false, _) => unified.range_search_batch_with_roaring_filter(
-                            &queries,
-                            query_count,
-                            params,
-                            &filter,
-                        ),
-                        (true, 0) => direct.range_search(&queries, params),
-                        (true, 1) => {
-                            direct.range_search_with_roaring_filter(&queries, params, &filter)
-                        }
-                        (true, 2) => direct.range_search_batch(&queries, query_count, params),
-                        (true, _) => direct.range_search_batch_with_roaring_filter(
-                            &queries,
-                            query_count,
-                            params,
-                            &filter,
-                        ),
-                    };
-                    if let Some(kind) = error {
-                        assert_eq!(
-                            result.unwrap_err().kind(),
-                            kind,
-                            "metric={metric:?}, direct={low_level}, entry={entry}"
-                        );
-                    } else {
-                        assert!(result.unwrap().labels().is_empty());
-                    }
-                }
-            }
+            let error = reader
+                .range_search_batch(
+                    queries,
+                    query_count,
+                    VectorRangeSearchParams::new(band, nprobe),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), InvalidInput, "{case}, metric={metric:?}");
         }
+        let params = VectorRangeSearchParams::new(empty, 2);
+        assert_eq!(
+            reader
+                .range_search_batch_with_roaring_filter(&query, 1, params, &[0xde, 0xad])
+                .unwrap_err()
+                .kind(),
+            InvalidInput
+        );
+        let result = reader.range_search_batch(&query, 1, params);
+        if metric == MetricType::L2 {
+            assert!(result.unwrap().labels().is_empty());
+        } else {
+            assert_eq!(result.unwrap_err().kind(), Unsupported);
+        }
+    }
+}
+
+#[test]
+fn ivf_sq_range_wrappers_delegate_input_validation() {
+    let bytes = serialize_sq(&build_sq_index(33, 35, 2));
+    let mut unified = VectorIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+    let mut direct = IVFSQIndexReader::open(Cursor::new(bytes)).unwrap();
+    let query = [0.0; 32];
+    let filter = serialize_roaring(&HashSet::new());
+    let params = VectorRangeSearchParams::new(l2(1.0, 1.0), 2);
+    for result in [
+        unified.range_search(&query, params),
+        unified.range_search_with_roaring_filter(&query, params, &filter),
+        unified.range_search_batch(&query, 1, params),
+        unified.range_search_batch_with_roaring_filter(&query, 1, params, &filter),
+        direct.range_search(&query, params),
+        direct.range_search_with_roaring_filter(&query, params, &filter),
+        direct.range_search_batch_with_roaring_filter(&query, 1, params, &filter),
+    ] {
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 }
 
