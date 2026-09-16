@@ -26,8 +26,8 @@
 //! `scan_codes_range` taking a `RangeQueryResult&`; one collector serves both
 //! here, so there is a single kernel rather than a pair to keep in step.
 //!
-//! `ivfflat_io::ReaderTopKHeap` and [`RangeCollector`] are the two
-//! implementations.
+//! `ivfflat_io::ReaderTopKHeap`, `topk::TopKHeap`, and [`RangeCollector`]
+//! implement the collection policies.
 
 use std::io;
 
@@ -64,7 +64,8 @@ pub(crate) trait Collector {
     fn cutoff(&self) -> f32;
 
     /// Delivers one row, with the value the family's scan computed for it. For
-    /// IVF-Flat that value is an exact distance; for IVF-RQ it is an estimate.
+    /// IVF-Flat that value is an exact distance; for IVF-RQ and IVF-SQ it is an
+    /// estimate.
     ///
     /// Fallible because a collector may own a resource the scan cannot see: the
     /// oversized-list path streams chunks through a callback, and without a
@@ -129,6 +130,12 @@ impl RangeCollector {
 
     pub(crate) fn into_rows(self) -> Vec<(i64, f32)> {
         self.rows
+    }
+
+    pub(crate) fn merge(&mut self, mut other: Self) {
+        self.scanned += other.scanned;
+        self.early_abandoned += other.early_abandoned;
+        self.rows.append(&mut other.rows);
     }
 }
 

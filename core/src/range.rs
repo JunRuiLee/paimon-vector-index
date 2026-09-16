@@ -345,8 +345,9 @@ impl RangeSearchStats {
     pub fn lists_probed(&self) -> usize {
         self.lists_probed
     }
-    /// Rows read and at least partially evaluated, **including** rows abandoned
-    /// early.
+    /// Allow-listed rows read and at least partially evaluated, **including**
+    /// rows abandoned early. Blocked SQ arithmetic may also evaluate excluded
+    /// lanes; those do not enter this logical counter.
     pub fn rows_scanned(&self) -> usize {
         self.rows_scanned
     }
@@ -355,7 +356,8 @@ impl RangeSearchStats {
     }
     /// Rows the scan rejected against the abandon cutoff rather than evaluating
     /// into the band test, which for IVF-Flat under L2 means their distance is
-    /// above the band's upper cut.
+    /// above the band's upper cut. IVF-SQ also counts estimates equal to that
+    /// exclusive cut, using its blocked quantized-distance kernel.
     ///
     /// A diagnostic, not a work measure: a row is counted whether the kernel
     /// stopped at its first term or at its last, so this is not the number of
@@ -379,7 +381,8 @@ impl RangeSearchCallStats {
     /// logical measure): empty lists do not count, because the existing reader
     /// issues no payload I/O for them, and the several chunks of an oversized
     /// list count once. There is no re-reading, so this is also the actual
-    /// number of list reads.
+    /// number of list reads. IVF-SQ partition-cache hits do not count, since
+    /// they issue no payload I/O.
     pub fn list_reads(&self) -> usize {
         self.list_reads
     }
