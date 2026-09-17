@@ -17,6 +17,8 @@
 
 use std::collections::HashMap;
 
+use crate::collect::Collector;
+
 pub(crate) struct TopKHeap {
     k: usize,
     max_distance: f32,
@@ -130,6 +132,21 @@ impl TopKHeap {
         self.data.swap(left, right);
         self.positions.insert(self.data[left].1, left);
         self.positions.insert(self.data[right].1, right);
+    }
+}
+
+impl Collector for TopKHeap {
+    #[inline]
+    fn cutoff(&self) -> f32 {
+        self.distance_limit()
+    }
+
+    #[inline]
+    fn push(&mut self, id: i64, value: f32) -> std::io::Result<()> {
+        if self.should_consider(value) {
+            self.push(value, id);
+        }
+        Ok(())
     }
 }
 

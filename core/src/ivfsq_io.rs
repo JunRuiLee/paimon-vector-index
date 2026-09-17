@@ -17,7 +17,9 @@
 
 //! Stable v1 storage and positional-I/O search for IVF-SQ8.
 
+use crate::collect::{Collector, RangeCollector};
 use crate::distance::{preprocess_vectors, MetricType};
+use crate::index::validate_queries;
 use crate::index_io_util::{
     bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, bytes_to_f32_vec,
     checked_list_bytes, checked_list_offset, checked_section_size, decode_delta_varint_ids,
@@ -30,6 +32,7 @@ use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
 use crate::ivfsq::IVFSQIndex;
 use crate::kmeans;
+use crate::range::{RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams};
 use crate::read_options::VectorIndexReaderOptions;
 use crate::sq::ScalarQuantizer;
 use crate::topk::TopKHeap;
@@ -37,7 +40,7 @@ use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::io;
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const IVF_SQ_MAGIC: u32 = 0x49565351; // "IVSQ"
 pub const IVF_SQ_VERSION: u32 = 1;
@@ -478,10 +481,18 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
     }
 
     fn read_scan_lists(&mut self, list_ids: &[usize]) -> io::Result<Vec<Arc<SqListData>>> {
+        self.read_scan_lists_with_count(list_ids)
+            .map(|(lists, _)| lists)
+    }
+
+    fn read_scan_lists_with_count(
+        &mut self,
+        list_ids: &[usize],
+    ) -> io::Result<(Vec<Arc<SqListData>>, usize)> {
         if self.list_cache.is_none() {
-            return self
-                .read_inverted_lists(list_ids)
-                .map(|lists| lists.into_iter().map(Arc::new).collect());
+            let lists = self.read_inverted_lists(list_ids)?;
+            let reads = lists.iter().filter(|list| !list.ids.is_empty()).count();
+            return Ok((lists.into_iter().map(Arc::new).collect(), reads));
         }
         let mut results = vec![None; list_ids.len()];
         let mut misses = Vec::new();
@@ -509,9 +520,11 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             }
             misses.push((position, list_id));
         }
+        let mut reads = 0;
         if !misses.is_empty() {
             let missing_ids = misses.iter().map(|&(_, id)| id).collect::<Vec<_>>();
             let loaded = self.read_inverted_lists(&missing_ids)?;
+            reads = loaded.iter().filter(|list| !list.ids.is_empty()).count();
             for ((position, list_id), list) in misses.into_iter().zip(loaded) {
                 let list = Arc::new(list);
                 self.list_cache.as_mut().unwrap().insert(CachedSqList {
@@ -524,7 +537,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                 results[position] = Some(list);
             }
         }
-        Ok(results.into_iter().map(Option::unwrap).collect())
+        Ok((results.into_iter().map(Option::unwrap).collect(), reads))
     }
 
     fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
@@ -556,7 +569,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
     fn for_each_streamed_list_chunk(
         &mut self,
         list_id: usize,
-        mut consume: impl FnMut(&[i64], &[u8]),
+        mut consume: impl FnMut(&[i64], &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         self.ensure_loaded()?;
         let count = self.list_counts[list_id] as usize;
@@ -600,7 +613,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             self.reader
                 .pread(&mut [ReadRequest::new(chunk_offset, &mut codes)])?;
             let row_end = row_start + chunk_rows;
-            consume(&ids[row_start..row_end], &codes);
+            consume(&ids[row_start..row_end], &codes)?;
             row_start = row_end;
         }
         Ok(())
@@ -651,10 +664,10 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                         &centroid,
                         &sq,
                         metric,
-                        filter,
+                        SqRowSelection::Filter(filter),
                         &mut scratch,
                         &mut heap,
-                    );
+                    )
                 })?;
                 batch_start += 1;
                 continue;
@@ -677,7 +690,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                     filter,
                     &mut SqScanScratch::default(),
                     &mut heap,
-                );
+                )?;
                 let cutoff = heap.distance_limit();
                 let per_list_results = lists[1..]
                     .par_iter()
@@ -693,10 +706,10 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                             filter,
                             scratch,
                             &mut local_heap,
-                        );
-                        local_heap.into_sorted()
+                        )?;
+                        Ok(local_heap.into_sorted())
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<io::Result<Vec<_>>>()?;
                 for results in per_list_results {
                     for (distance, row_id) in results {
                         heap.push(distance, row_id);
@@ -715,7 +728,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                         filter,
                         &mut scratch,
                         &mut heap,
-                    );
+                    )?;
                 }
             }
             batch_start = batch_end;
@@ -732,6 +745,248 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         let filter = decode_roaring_filter(roaring_filter_bytes)?;
         self.search_with_filter(query, k, nprobe, Some(&filter))
+    }
+
+    /// Returns every probed row whose SQ-estimated squared L2 distance is in
+    /// the half-open band. Results are unsorted, unpadded, and never truncated.
+    /// Even probing every list does not guarantee membership under the original
+    /// vectors' distances: scalar quantization can move a row across either cut.
+    pub fn range_search(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_with_filter(query, params, None)
+    }
+
+    pub fn range_search_with_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_batch_with_filter(query, 1, params, filter)
+    }
+
+    /// Restricts membership to the serialized Roaring allow-list. Malformed
+    /// filters are rejected even for an empty band.
+    pub fn range_search_with_roaring_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        self.range_search_with_filter(query, params, Some(&filter))
+    }
+
+    /// Batched SQ-estimate range search; shared probed lists are read once.
+    pub fn range_search_batch(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_batch_with_filter(queries, query_count, params, None)
+    }
+
+    pub fn range_search_batch_with_roaring_filter(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        self.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
+    }
+
+    pub fn range_search_batch_with_filter(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+    ) -> io::Result<RangeSearchResult> {
+        validate_queries(queries, query_count, self.d)?;
+        if params.band().metric() != self.metric {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "band metric {:?} does not match index metric {:?}",
+                    params.band().metric(),
+                    self.metric
+                ),
+            ));
+        }
+        let nprobe = params.validate(self.nlist)?;
+        let mut builder = RangeResultBuilder::new(query_count);
+        let band = params.band();
+        if band.is_empty() {
+            return Ok(builder.build());
+        }
+        self.ensure_loaded()?;
+        let dimension = self.d;
+        let (probe_lists, _) = kmeans::find_topk_batch(
+            queries,
+            query_count,
+            &self.quantizer_centroids,
+            self.nlist,
+            dimension,
+            nprobe,
+        );
+        let mut list_to_queries = vec![Vec::new(); self.nlist];
+        let mut unique_lists = Vec::new();
+        for (query_index, lists) in probe_lists.iter().enumerate() {
+            builder.record_lists_probed(query_index, lists.len());
+            for &list_id in lists {
+                if list_to_queries[list_id].is_empty() {
+                    unique_lists.push(list_id);
+                }
+                list_to_queries[list_id].push(query_index);
+            }
+        }
+        let mut collectors = (0..query_count)
+            .map(|_| RangeCollector::new(band))
+            .collect::<Vec<_>>();
+        let mut scratch = SqScanScratch::default();
+        let mut batch_start = 0;
+        while batch_start < unique_lists.len() {
+            let first_list = unique_lists[batch_start];
+            if ivf_payload_is_oversized(self.list_payload_len(first_list)?) {
+                let centroid = self.quantizer_centroids
+                    [first_list * dimension..(first_list + 1) * dimension]
+                    .to_vec();
+                let sq = self.list_sqs.get(first_list).unwrap_or(&self.sq).clone();
+                builder.record_list_read();
+                self.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                    let masks = filter.map(|filter| sq_filter_masks(ids, filter));
+                    let selection = SqRowSelection::from_masks(masks.as_deref());
+                    let query_indices = &list_to_queries[first_list];
+                    if query_indices.len() == 1 {
+                        let query_index = query_indices[0];
+                        scan_sq_rows(
+                            &queries[query_index * dimension..(query_index + 1) * dimension],
+                            ids,
+                            codes,
+                            &centroid,
+                            &sq,
+                            MetricType::L2,
+                            selection,
+                            &mut scratch,
+                            &mut collectors[query_index],
+                        )?;
+                    } else {
+                        let mut chunk_collectors = query_indices
+                            .iter()
+                            .map(|&query_index| (query_index, RangeCollector::new(band)))
+                            .collect::<Vec<_>>();
+                        scan_sq_range_chunk(
+                            queries,
+                            ids,
+                            codes,
+                            &centroid,
+                            &sq,
+                            selection,
+                            &mut scratch,
+                            &mut chunk_collectors,
+                        )?;
+                        for (query_index, collector) in chunk_collectors {
+                            collectors[query_index].merge(collector);
+                        }
+                    }
+                    Ok(())
+                })?;
+                batch_start += 1;
+                continue;
+            }
+            let count = self.batch_read_end(&unique_lists[batch_start..])?.max(1);
+            let batch_end = (batch_start + count).min(unique_lists.len());
+            let (lists, reads) =
+                self.read_scan_lists_with_count(&unique_lists[batch_start..batch_end])?;
+            for _ in 0..reads {
+                builder.record_list_read();
+            }
+            let masks = filter.map(|filter| {
+                lists
+                    .iter()
+                    .map(|list| sq_filter_masks(&list.ids, filter))
+                    .collect::<Vec<_>>()
+            });
+            let candidates = lists.iter().fold(0usize, |total, list| {
+                total.saturating_add(
+                    list.ids
+                        .len()
+                        .saturating_mul(list_to_queries[list.list_id].len()),
+                )
+            });
+            let scan_one = |query_index: usize,
+                            position: usize,
+                            scratch: &mut SqScanScratch,
+                            collector: &mut RangeCollector| {
+                let list = &lists[position];
+                let list_id = list.list_id;
+                let selection = SqRowSelection::from_masks(
+                    masks.as_ref().map(|masks| masks[position].as_slice()),
+                );
+                scan_sq_rows(
+                    &queries[query_index * dimension..(query_index + 1) * dimension],
+                    &list.ids,
+                    &list.codes,
+                    &self.quantizer_centroids[list_id * dimension..(list_id + 1) * dimension],
+                    self.list_sqs.get(list_id).unwrap_or(&self.sq),
+                    MetricType::L2,
+                    selection,
+                    scratch,
+                    collector,
+                )
+            };
+            if query_count == 1 && lists.len() > 1 && candidates >= PARALLEL_SQ_SCAN_MIN_CANDIDATES
+            {
+                let output = Mutex::new(&mut collectors[0]);
+                lists.par_iter().enumerate().try_for_each_init(
+                    SqScanScratch::default,
+                    |scratch, (position, _)| {
+                        let mut collector = RangeCollector::new(band);
+                        scan_one(0, position, scratch, &mut collector)?;
+                        output.lock().expect("range output lock").merge(collector);
+                        Ok::<(), io::Error>(())
+                    },
+                )?;
+            } else {
+                let mut positions = vec![None; self.nlist];
+                for (position, list) in lists.iter().enumerate() {
+                    positions[list.list_id] = Some(position);
+                }
+                let scan_query =
+                    |scratch: &mut SqScanScratch,
+                     (query_index, collector): (usize, &mut RangeCollector)| {
+                        for &list_id in &probe_lists[query_index] {
+                            if let Some(position) = positions[list_id] {
+                                scan_one(query_index, position, scratch, collector)?;
+                            }
+                        }
+                        Ok::<(), io::Error>(())
+                    };
+                if query_count > 1 && candidates >= PARALLEL_SQ_SCAN_MIN_CANDIDATES {
+                    collectors
+                        .par_iter_mut()
+                        .enumerate()
+                        .try_for_each_init(SqScanScratch::default, scan_query)?;
+                } else {
+                    for query in collectors.iter_mut().enumerate() {
+                        scan_query(&mut scratch, query)?;
+                    }
+                }
+            }
+            batch_start = batch_end;
+        }
+        for (query_index, collector) in collectors.into_iter().enumerate() {
+            builder.record_scanned(query_index, collector.scanned());
+            builder.record_early_abandoned(query_index, collector.early_abandoned());
+            builder.take_rows(query_index, collector.into_rows());
+        }
+        Ok(builder.build())
     }
 }
 
@@ -833,11 +1088,12 @@ pub(crate) fn search_batch_ivfsq_reader_filter_range<R: SeekRead>(
                         &centroid,
                         &sq,
                         metric,
-                        filter,
+                        SqRowSelection::Filter(filter),
                         &mut stream_scratch,
                         &mut heaps[query_index],
-                    );
+                    )?;
                 }
+                Ok(())
             })?;
             batch_start += 1;
             continue;
@@ -854,7 +1110,7 @@ pub(crate) fn search_batch_ivfsq_reader_filter_range<R: SeekRead>(
         }
         // Keep a query's heap across partitions. Besides avoiding nprobe
         // allocations and merges, this carries the current cutoff into later scans.
-        heaps.par_iter_mut().enumerate().for_each_init(
+        heaps.par_iter_mut().enumerate().try_for_each_init(
             SqScanScratch::default,
             |scratch, (query_index, heap)| {
                 let query = &processed[query_index * d..(query_index + 1) * d];
@@ -869,11 +1125,12 @@ pub(crate) fn search_batch_ivfsq_reader_filter_range<R: SeekRead>(
                             filter,
                             scratch,
                             heap,
-                        );
+                        )?;
                     }
                 }
+                Ok::<(), io::Error>(())
             },
-        );
+        )?;
         batch_start = batch_end;
     }
 
@@ -1060,12 +1317,72 @@ struct SqScanScratch {
     distances: Vec<f32>,
 }
 
+#[derive(Clone, Copy)]
+enum SqRowSelection<'a> {
+    Filter(Option<&'a dyn RowIdFilter>),
+    BlockMasks(&'a [u32]),
+}
+
+impl<'a> SqRowSelection<'a> {
+    fn from_masks(masks: Option<&'a [u32]>) -> Self {
+        masks.map(Self::BlockMasks).unwrap_or(Self::Filter(None))
+    }
+}
+
+fn sq_filter_masks(ids: &[i64], filter: &dyn RowIdFilter) -> Vec<u32> {
+    ids.chunks(IVF_SQ_SCAN_BLOCK_SIZE)
+        .map(|block| {
+            block.iter().enumerate().fold(0, |mask, (lane, &id)| {
+                mask | (u32::from(filter.contains(id)) << lane)
+            })
+        })
+        .collect()
+}
+
 // Below this point Rayon task setup and per-list heap merging dominate the
 // blocked SQ arithmetic. Production-sized lists usually cross the threshold;
 // small indexes stay on the lower-overhead sequential path.
 const PARALLEL_SQ_SCAN_MIN_CANDIDATES: usize = 8 * 1024;
 
-fn scan_sq_list(
+fn scan_sq_range_chunk<C: Collector + Send>(
+    queries: &[f32],
+    ids: &[i64],
+    codes: &[u8],
+    centroid: &[f32],
+    sq: &ScalarQuantizer,
+    selection: SqRowSelection<'_>,
+    scratch: &mut SqScanScratch,
+    collectors: &mut [(usize, C)],
+) -> io::Result<()> {
+    let dimension = centroid.len();
+    let scan_query = |scratch: &mut SqScanScratch, (query_index, collector): &mut (usize, C)| {
+        scan_sq_rows(
+            &queries[*query_index * dimension..(*query_index + 1) * dimension],
+            ids,
+            codes,
+            centroid,
+            sq,
+            MetricType::L2,
+            selection,
+            scratch,
+            collector,
+        )
+    };
+    if collectors.len() > 1
+        && ids.len().saturating_mul(collectors.len()) >= PARALLEL_SQ_SCAN_MIN_CANDIDATES
+    {
+        collectors
+            .par_iter_mut()
+            .try_for_each_init(SqScanScratch::default, scan_query)?;
+    } else {
+        for collector in collectors {
+            scan_query(scratch, collector)?;
+        }
+    }
+    Ok(())
+}
+
+fn scan_sq_list<C: Collector>(
     query: &[f32],
     list: &SqListData,
     centroid: &[f32],
@@ -1073,8 +1390,8 @@ fn scan_sq_list(
     metric: MetricType,
     filter: Option<&dyn RowIdFilter>,
     scratch: &mut SqScanScratch,
-    heap: &mut TopKHeap,
-) {
+    collector: &mut C,
+) -> io::Result<()> {
     scan_sq_rows(
         query,
         &list.ids,
@@ -1082,23 +1399,28 @@ fn scan_sq_list(
         centroid,
         sq,
         metric,
-        filter,
+        SqRowSelection::Filter(filter),
         scratch,
-        heap,
-    );
+        collector,
+    )
 }
 
-fn scan_sq_rows(
+fn scan_sq_rows<C: Collector>(
     query: &[f32],
     ids: &[i64],
     codes: &[u8],
     centroid: &[f32],
     sq: &ScalarQuantizer,
     metric: MetricType,
-    filter: Option<&dyn RowIdFilter>,
+    selection: SqRowSelection<'_>,
     scratch: &mut SqScanScratch,
-    heap: &mut TopKHeap,
-) {
+    collector: &mut C,
+) -> io::Result<()> {
+    if matches!(selection, SqRowSelection::BlockMasks(masks) if masks.iter().all(|&mask| mask == 0))
+    {
+        return Ok(());
+    }
+    let cutoff = collector.cutoff();
     sq.distances_to_blocked_codes_with_offset(
         query,
         codes,
@@ -1106,18 +1428,43 @@ fn scan_sq_rows(
         centroid,
         metric,
         IVF_SQ_SCAN_BLOCK_SIZE,
-        heap.distance_limit(),
+        cutoff,
         &mut scratch.parameters,
         &mut scratch.distances,
     );
-    for (&row_id, &distance) in ids.iter().zip(&scratch.distances) {
-        if filter.map(|f| !f.contains(row_id)).unwrap_or(false) {
-            continue;
+    let mut collect_row = |row_id, distance: f32| {
+        if distance.is_finite() && distance >= cutoff {
+            collector.note_abandoned();
+        } else {
+            collector.push(row_id, distance)?;
         }
-        if heap.should_consider(distance) {
-            heap.push(distance, row_id);
+        Ok::<(), io::Error>(())
+    };
+    match selection {
+        SqRowSelection::Filter(filter) => {
+            for (&row_id, &distance) in ids.iter().zip(&scratch.distances) {
+                if filter
+                    .map(|filter| !filter.contains(row_id))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                collect_row(row_id, distance)?;
+            }
+        }
+        SqRowSelection::BlockMasks(masks) => {
+            for (block, &mask) in masks.iter().enumerate() {
+                let mut remaining = mask;
+                while remaining != 0 {
+                    let position =
+                        block * IVF_SQ_SCAN_BLOCK_SIZE + remaining.trailing_zeros() as usize;
+                    collect_row(ids[position], scratch.distances[position])?;
+                    remaining &= remaining - 1;
+                }
+            }
         }
     }
+    Ok(())
 }
 
 fn padded_results(heap: TopKHeap, k: usize) -> (Vec<i64>, Vec<f32>) {
@@ -1299,10 +1646,281 @@ mod tests {
     use super::*;
     use crate::io::PosWriter;
     use crate::io::ReadRequest;
+    use crate::range::{Bound, DistanceBand};
     use roaring::RoaringTreemap;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn ivfsq_range_streamed_chunk_scans_queries_on_multiple_workers() {
+        struct TrackingCollector<'a> {
+            inner: RangeCollector,
+            workers: &'a AtomicU64,
+        }
+
+        impl Collector for TrackingCollector<'_> {
+            fn cutoff(&self) -> f32 {
+                let worker = rayon::current_thread_index().unwrap();
+                self.workers.fetch_or(1 << worker, Ordering::Relaxed);
+                self.inner.cutoff()
+            }
+
+            fn push(&mut self, id: i64, value: f32) -> io::Result<()> {
+                self.inner.push(id, value)
+            }
+
+            fn note_abandoned(&mut self) {
+                self.inner.note_abandoned();
+            }
+        }
+
+        let dimension = 65;
+        let count = 8_193;
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let codes = vec![0; count * dimension];
+        let centroid = vec![0.0; dimension];
+        let sq = ScalarQuantizer::with_bounds(dimension, 0.0, 1.0);
+        let queries = (0..16)
+            .flat_map(|query_index| vec![query_index as f32 * 0.25; dimension])
+            .collect::<Vec<_>>();
+        let band =
+            DistanceBand::new(Bound::Finite(1.0), Bound::Finite(200.0), MetricType::L2).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let allowed: RoaringTreemap = (0..count as u64).filter(|id| id % 3 == 0).collect();
+        let masks = sq_filter_masks(&ids, &allowed);
+        for selection in [
+            SqRowSelection::Filter(None),
+            SqRowSelection::BlockMasks(&masks),
+        ] {
+            let workers = AtomicU64::new(0);
+            let query_indices = [14, 2, 12, 4, 10, 6, 8, 0];
+            let mut collectors = query_indices
+                .iter()
+                .map(|&query_index| {
+                    (
+                        query_index,
+                        TrackingCollector {
+                            inner: RangeCollector::new(band),
+                            workers: &workers,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            pool.install(|| {
+                scan_sq_range_chunk(
+                    &queries,
+                    &ids,
+                    &codes,
+                    &centroid,
+                    &sq,
+                    selection,
+                    &mut SqScanScratch::default(),
+                    &mut collectors,
+                )
+                .unwrap();
+            });
+            assert!(
+                workers.load(Ordering::Relaxed).count_ones() > 1,
+                "streamed chunks must scan active queries on multiple Rayon workers"
+            );
+            for (query_index, collector) in collectors {
+                let mut expected = RangeCollector::new(band);
+                scan_sq_rows(
+                    &queries[query_index * dimension..(query_index + 1) * dimension],
+                    &ids,
+                    &codes,
+                    &centroid,
+                    &sq,
+                    MetricType::L2,
+                    selection,
+                    &mut SqScanScratch::default(),
+                    &mut expected,
+                )
+                .unwrap();
+                assert_eq!(collector.inner.scanned(), expected.scanned());
+                assert_eq!(
+                    collector.inner.early_abandoned(),
+                    expected.early_abandoned()
+                );
+                assert_eq!(collector.inner.into_rows(), expected.into_rows());
+            }
+        }
+    }
+
+    #[test]
+    fn ivfsq_range_streamed_chunk_propagates_parallel_collector_failure() {
+        struct FailingCollector;
+
+        impl Collector for FailingCollector {
+            fn cutoff(&self) -> f32 {
+                f32::INFINITY
+            }
+
+            fn push(&mut self, _id: i64, _value: f32) -> io::Result<()> {
+                Err(io::Error::other("parallel collector failed"))
+            }
+        }
+
+        let ids = (0..4_097).collect::<Vec<_>>();
+        let codes = vec![0; ids.len()];
+        let sq = ScalarQuantizer::with_bounds(1, 0.0, 1.0);
+        let error = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_sq_range_chunk(
+                    &[0.0, 1.0],
+                    &ids,
+                    &codes,
+                    &[0.0],
+                    &sq,
+                    SqRowSelection::Filter(None),
+                    &mut SqScanScratch::default(),
+                    &mut [(0, FailingCollector), (1, FailingCollector)],
+                )
+                .unwrap_err()
+            });
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "parallel collector failed");
+    }
+
+    #[test]
+    fn ivfsq_range_batch_evaluates_filter_once_per_list_row() {
+        struct CountingFilter(AtomicUsize);
+
+        impl RowIdFilter for CountingFilter {
+            fn contains(&self, id: i64) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                id % 3 == 0
+            }
+        }
+
+        let (index, data, ids) = build_index(37, 4, 1_024);
+        let mut reader = IVFSQIndexReader::open(Cursor::new(serialized_index(&index))).unwrap();
+        let filter = CountingFilter(AtomicUsize::new(0));
+        let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        let result = reader
+            .range_search_batch_with_filter(
+                &data[..37 * 3],
+                3,
+                VectorRangeSearchParams::new(band, 4),
+                Some(&filter),
+            )
+            .unwrap();
+        assert_eq!(filter.0.load(Ordering::Relaxed), ids.len());
+        let expected = ids.iter().filter(|&&id| id % 3 == 0).count();
+        for query_index in 0..3 {
+            assert_eq!(result.query(query_index).labels.len(), expected);
+        }
+    }
+
+    #[test]
+    fn ivfsq_range_cutoff_preserves_block_and_tail_membership() {
+        for dimension in [1, 31, 32, 33, 64, 65, 128] {
+            for count in [1, 31, 32, 33, 64, 67] {
+                let sq = ScalarQuantizer::with_bounds(dimension, -1.3, 2.7);
+                let query = vec![0.2; dimension];
+                let centroid = vec![0.7; dimension];
+                let ids = (0..count as i64).collect::<Vec<_>>();
+                let codes = (0..count)
+                    .flat_map(|row| {
+                        (0..dimension)
+                            .map(move |component| ((row * 17 + component * 7) % 256) as u8)
+                    })
+                    .collect::<Vec<_>>();
+                let blocked = block_sorted_sq_codes(
+                    &codes,
+                    &(0..count).collect::<Vec<_>>(),
+                    dimension,
+                    IVF_SQ_SCAN_BLOCK_SIZE,
+                );
+                let mut full = SqScanScratch::default();
+                sq.distances_to_blocked_codes_with_offset(
+                    &query,
+                    &blocked,
+                    count,
+                    &centroid,
+                    MetricType::L2,
+                    IVF_SQ_SCAN_BLOCK_SIZE,
+                    f32::INFINITY,
+                    &mut full.parameters,
+                    &mut full.distances,
+                );
+                let allowed: RoaringTreemap = (0..count as u64).filter(|id| id % 3 == 0).collect();
+                for filter in [None, Some(&allowed as &dyn RowIdFilter)] {
+                    let masks = filter.map(|filter| sq_filter_masks(&ids, filter));
+                    for selection in [
+                        SqRowSelection::Filter(filter),
+                        SqRowSelection::from_masks(masks.as_deref()),
+                    ] {
+                        for upper in [
+                            Bound::Unbounded,
+                            Bound::Finite(0.0),
+                            Bound::Finite(full.distances[count / 2]),
+                        ] {
+                            let band = DistanceBand::new(Bound::Finite(0.0), upper, MetricType::L2)
+                                .unwrap();
+                            let mut collector = RangeCollector::new(band);
+                            scan_sq_rows(
+                                &query,
+                                &ids,
+                                &blocked,
+                                &centroid,
+                                &sq,
+                                MetricType::L2,
+                                selection,
+                                &mut SqScanScratch::default(),
+                                &mut collector,
+                            )
+                            .unwrap();
+                            let expected = ids
+                                .iter()
+                                .copied()
+                                .zip(full.distances.iter().copied())
+                                .filter(|(id, distance)| {
+                                    filter.map(|filter| filter.contains(*id)).unwrap_or(true)
+                                        && band.admit(*distance)
+                                })
+                                .map(|(id, distance)| (id, distance.to_bits()))
+                                .collect::<Vec<_>>();
+                            let scanned = ids
+                                .iter()
+                                .filter(|&&id| {
+                                    filter.map(|filter| filter.contains(id)).unwrap_or(true)
+                                })
+                                .count();
+                            assert_eq!(collector.scanned(), scanned);
+                            assert_eq!(collector.early_abandoned(), scanned - expected.len());
+                            assert_eq!(
+                                collector
+                                    .into_rows()
+                                    .into_iter()
+                                    .map(|(id, distance)| (id, distance.to_bits()))
+                                    .collect::<Vec<_>>(),
+                                expected,
+                                "dimension={dimension}, count={count}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ivfsq_streamed_list_propagates_consumer_failure() {
+        let (index, _, _) = build_index(8, 1, 257);
+        let mut reader = IVFSQIndexReader::open(Cursor::new(serialized_index(&index))).unwrap();
+        let error = reader
+            .for_each_streamed_list_chunk(0, |_, _| Err(io::Error::other("collector failed")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "collector failed");
+    }
 
     #[test]
     fn ivfsq_partition_cache_reuses_payloads_and_keeps_filters_query_local() {
@@ -1453,6 +2071,7 @@ mod tests {
             .for_each_streamed_list_chunk(0, |ids, codes| {
                 actual_ids.extend_from_slice(ids);
                 actual_codes.extend_from_slice(codes);
+                Ok(())
             })
             .unwrap();
         assert_eq!(actual_ids, expected.0);

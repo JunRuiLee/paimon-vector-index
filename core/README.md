@@ -22,14 +22,15 @@
 `paimon-vindex-core` contains the Rust implementations and seek-based readers
 for IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ, and DiskANN.
 
-The Rust reader supports distance range search for IVF-FLAT and IVF-RQ with
+The Rust reader supports distance range search for IVF-FLAT, IVF-RQ, and IVF-SQ with
 squared L2, using `DistanceBand`, `VectorRangeSearchParams`, and CSR
-`RangeSearchResult` buffers. Both families support single and batch queries,
+`RangeSearchResult` buffers. All three families support single and batch queries,
 with or without a serialized Roaring allow-list, and a fixed positive `nprobe`.
 IVF-FLAT tests exact distances; IVF-RQ tests its one-bit or full multi-bit
-estimated distances. Results are uncapped and unordered. Probing every list
-removes the IVF coverage gap, but not IVF-RQ's quantization error. The range
-path does not change top-K search or the v1 storage format.
+estimated distances; IVF-SQ tests scalar-quantized estimates. Results are uncapped
+and unordered. Probing every list removes the IVF coverage gap, but not the
+quantization error of IVF-RQ or IVF-SQ. The range path does not change top-K
+search or the v1 storage format.
 
 See the [range search guide](../docs/range-search.html) for membership,
 validation, filtering, and statistics. C/JNI range bindings are not included.
@@ -40,6 +41,27 @@ abstractions. It does not incorporate source code from Microsoft's
 [MIT-licensed DiskANN repository](https://github.com/microsoft/DiskANN).
 The implementation supports L2, inner-product, and cosine search with the same
 lower-is-better distance semantics as the IVF indexes.
+
+## IVF-SQ range search
+
+Use `DistanceBand` and `VectorRangeSearchParams` with `range_search`,
+`range_search_batch`, or their `*_with_roaring_filter` variants. Bands are
+half-open `[lower, upper)` in squared-L2 units; results use `RangeSearchResult`
+CSR buffers without sorting, padding, or a top-K cap.
+
+IVF-SQ uses the same blocked SIMD estimator as top-K, including the stored
+per-list residual bounds. Raising `nprobe` visits more lists but does not remove
+quantization error: even at `nprobe == nlist`, membership can differ from the
+original vectors' distances at either boundary. Prefer IVF-FLAT when exact
+membership is required. There is no original-vector reranking or top-K fallback.
+
+Batch queries share list reads, reuse the existing partition cache, and evaluate
+the Roaring allow-list once per list row using query-local one-bit-per-row masks.
+Large lists stream in bounded chunks; scan scratch is reused, and a finite upper cut
+allows entire SQ blocks to stop after their partial distances reach that cut.
+Result memory still grows with the number of hits. Cache hits are excluded from
+`call_stats().list_reads()`. Range support does not extend to other metrics,
+IVF-PQ, DiskANN, or language bindings in this change.
 
 The crate ships its [normative v1 storage-format specification](STORAGE_FORMAT.md)
 and byte-exact fixtures. Project documentation, language bindings, and
