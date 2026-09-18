@@ -161,6 +161,21 @@ fn pq_dense_opq_fixture(bits: usize, residual: bool) -> IVFPQIndex {
     index
 }
 
+fn pq_coarse_batch_fixture() -> IVFPQIndex {
+    let fixture = pq_dense_opq_fixture(8, true);
+    let mut index = IVFPQIndex::with_nbits(64, 128, 8, 8, MetricType::L2, true);
+    let mut centroids = fixture.quantizer_centroids().to_vec();
+    centroids.resize(index.nlist * index.d, 1000.0);
+    index.set_quantizer_centroids(centroids);
+    index.pq = fixture.pq;
+    index.opq = fixture.opq;
+    for list in 0..fixture.nlist {
+        index.ids[list] = fixture.ids[list][..7].to_vec();
+        index.codes[list] = fixture.codes[list][..7 * index.pq.code_size()].to_vec();
+    }
+    index
+}
+
 fn pq_bytes(index: &IVFPQIndex) -> Vec<u8> {
     let mut bytes = Vec::new();
     write_index(index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -429,6 +444,130 @@ fn pq_range_dense_opq_parallel_batches_preserve_float_adc_results() {
                 });
             }
         }
+    }
+}
+
+#[test]
+fn pq_range_coarse_parallel_partial_probes_preserve_query_order() {
+    let index = pq_coarse_batch_fixture();
+    let query_count = 16;
+    let queries = (0..query_count)
+        .flat_map(|query_index| {
+            (0..index.d).map(move |coordinate| {
+                if coordinate == 0 {
+                    (query_index % 3) as f32 * 12.0 - 12.0
+                } else {
+                    (query_index * 17 + coordinate) as f32 / 64.0 - 2.0
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let reversed = queries
+        .chunks_exact(index.d)
+        .rev()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let params = pq_all_params(2);
+    let snapshots = [1, 4].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                let mut reader = pq_reader(&index);
+                let batch = reader
+                    .range_search_batch(&queries, query_count, params)
+                    .unwrap();
+                let reordered = reader
+                    .range_search_batch(&reversed, query_count, params)
+                    .unwrap();
+                assert_eq!(batch.query_count(), query_count);
+                assert_eq!(reordered.query_count(), query_count);
+                let rows = (0..query_count)
+                    .map(|query_index| pq_rows(batch.query(query_index)))
+                    .collect::<Vec<_>>();
+                for (query_index, query) in queries.chunks_exact(index.d).enumerate() {
+                    let single = reader.range_search(query, params).unwrap();
+                    assert_eq!(rows[query_index], pq_rows(single.query(0)));
+                    assert_eq!(
+                        rows[query_index],
+                        pq_rows(reordered.query(query_count - 1 - query_index))
+                    );
+                    assert_eq!(batch.query(query_index).stats.lists_probed(), 2);
+                    let expected = pq_oracle(&index, query, 2);
+                    assert_eq!(rows[query_index].len(), 14);
+                    assert_eq!(rows[query_index].len(), expected.len());
+                    for (&(id, distance), &(expected_id, expected_distance)) in
+                        rows[query_index].iter().zip(&expected)
+                    {
+                        assert_eq!(id, expected_id);
+                        assert!(
+                            (distance - expected_distance).abs()
+                                <= 1e-5 * expected_distance.abs().max(1.0)
+                        );
+                    }
+                }
+                assert!(rows.windows(2).all(|pair| pair[0] != pair[1]));
+                rows
+            })
+    });
+    assert_eq!(snapshots[0], snapshots[1]);
+}
+
+#[test]
+fn pq_range_coarse_parallel_overflow_precedes_payload_io() {
+    let index = pq_coarse_batch_fixture();
+    let query_count = 16;
+    let params = pq_all_params(1);
+    let empty_filter = serialize_roaring(&HashSet::new());
+    for threads in [1, 4] {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                let valid_prefix = vec![0.0; (query_count - 1) * index.d];
+                pq_reader(&index)
+                    .range_search_batch(&valid_prefix, query_count - 1, params)
+                    .unwrap();
+                for (late_value, far_value, diagnostic) in [
+                    (1e20, 1000.0, "query-centroid distance"),
+                    (0.0, 1e20, "query-centroid distance for list 127"),
+                    (f32::MAX, 1000.0, "rotated query"),
+                ] {
+                    let mut queries = vec![0.0; query_count * index.d];
+                    queries[(query_count - 1) * index.d..].fill(late_value);
+                    let trace = Arc::new(Mutex::new(SqReadTrace::default()));
+                    let source = SqRecordingReader {
+                        inner: Cursor::new(pq_bytes(&index)),
+                        trace: Arc::clone(&trace),
+                    };
+                    let mut reader = IVFPQIndexReader::open(source).unwrap();
+                    reader.ensure_loaded().unwrap();
+                    *reader.quantizer_centroids.last_mut().unwrap() = far_value;
+                    assert!(queries.iter().all(|value| value.is_finite()));
+                    assert!(reader
+                        .quantizer_centroids
+                        .iter()
+                        .all(|value| value.is_finite()));
+                    *trace.lock().unwrap() = SqReadTrace::default();
+                    for result in [
+                        reader.range_search_batch(&queries, query_count, params),
+                        reader.range_search_batch_with_roaring_filter(
+                            &queries,
+                            query_count,
+                            params,
+                            &empty_filter,
+                        ),
+                    ] {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                        assert!(error.to_string().contains(diagnostic), "{error}");
+                    }
+                    assert_eq!(trace.lock().unwrap().calls, 0);
+                }
+            });
     }
 }
 

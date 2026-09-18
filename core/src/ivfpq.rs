@@ -1757,9 +1757,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             return Ok(builder.build());
         }
         self.ensure_loaded()?;
-        let mut query_states = Vec::with_capacity(query_count);
-        let mut list_to_queries = vec![Vec::new(); self.nlist];
-        for (query_index, query) in queries.chunks_exact(self.d).enumerate() {
+        let prepare_query = |(query_index, query): (usize, &[f32])| {
             let mut prepared = query.to_vec();
             if let Some(opq) = &self.opq {
                 opq.apply(query, &mut prepared);
@@ -1783,16 +1781,39 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                     format!("non-finite IVF-PQ query-centroid distance for list {list}"),
                 )
             })?;
-            builder.record_lists_probed(query_index, probes.len());
-            for (_, list) in probes {
-                list_to_queries[list].push(query_index);
-            }
-            query_states.push(Some(PqRangeQuery::new(
-                query_index,
-                prepared,
-                RangeCollector::new(params.band()),
-            )));
-        }
+            Ok((
+                PqRangeQuery::new(query_index, prepared, RangeCollector::new(params.band())),
+                probes,
+            ))
+        };
+        let coarse_work = query_count
+            .saturating_mul(self.nlist)
+            .saturating_mul(self.d);
+        let prepared_queries =
+            if query_count > 1 && coarse_work >= PARALLEL_PQ_RANGE_MIN_COARSE_COMPONENTS {
+                queries
+                    .par_chunks_exact(self.d)
+                    .enumerate()
+                    .map(prepare_query)
+                    .collect::<io::Result<Vec<_>>>()?
+            } else {
+                queries
+                    .chunks_exact(self.d)
+                    .enumerate()
+                    .map(prepare_query)
+                    .collect::<io::Result<Vec<_>>>()?
+            };
+        let mut list_to_queries = vec![Vec::new(); self.nlist];
+        let mut query_states = prepared_queries
+            .into_iter()
+            .map(|(query, probes)| {
+                builder.record_lists_probed(query.query_index, probes.len());
+                for (_, list) in probes {
+                    list_to_queries[list].push(query.query_index);
+                }
+                Some(query)
+            })
+            .collect::<Vec<_>>();
         let mut list_ids = (0..self.nlist)
             .filter(|&list| !list_to_queries[list].is_empty() && self.list_counts[list] > 0)
             .collect::<Vec<_>>();
@@ -1889,6 +1910,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
 
 const PQ_RANGE_TABLE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const PARALLEL_PQ_RANGE_MIN_CANDIDATES: usize = 8 * 1024;
+const PARALLEL_PQ_RANGE_MIN_COARSE_COMPONENTS: usize = 128 * 1024;
 
 #[derive(Default)]
 struct PqRangeScratch {
