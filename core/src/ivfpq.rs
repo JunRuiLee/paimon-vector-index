@@ -1935,7 +1935,6 @@ const PARALLEL_PQ_RANGE_MIN_COARSE_COMPONENTS: usize = 128 * 1024;
 struct PqRangeScratch {
     residual_query: Vec<f32>,
     table: Vec<f32>,
-    first_subtable: Vec<f32>,
 }
 
 struct PqRangeQuery<C> {
@@ -2001,7 +2000,7 @@ fn scan_pq_range_list<C: Collector + Send>(
                 );
                 query.table_list = Some(list_id);
             }
-            &mut query.table
+            &query.table
         } else {
             build_pq_range_table(
                 pq,
@@ -2011,34 +2010,22 @@ fn scan_pq_range_list<C: Collector + Send>(
                 &mut scratch.residual_query,
                 &mut scratch.table,
             );
-            &mut scratch.table
+            &scratch.table
         };
         let ip_offset = centroid
             .filter(|_| cached_ip_table)
             .map(|centroid| -fvec_inner_product(&query.query, centroid));
-        if let Some(offset) = ip_offset {
-            scratch.first_subtable.clear();
-            scratch
-                .first_subtable
-                .extend_from_slice(&table[..pq.ksub()]);
-            for entry in &mut table[..pq.ksub()] {
-                *entry += offset;
-            }
-        }
-        let result = scan_pq_range_codes(
+        scan_pq_range_codes(
             pq,
             table,
             query.metric,
+            ip_offset,
             ids,
             codes,
             transposed,
             positions.as_ref(),
             &mut query.collector,
-        );
-        if ip_offset.is_some() {
-            table[..pq.ksub()].copy_from_slice(&scratch.first_subtable);
-        }
-        result
+        )
     };
     let matching_count = positions.as_ref().map_or(ids.len(), MatchingRows::len);
     if scratch.len() > 1
@@ -2107,6 +2094,7 @@ fn scan_pq_range_codes<C: Collector>(
     pq: &ProductQuantizer,
     table: &[f32],
     metric: MetricType,
+    ip_offset: Option<f32>,
     ids: &[i64],
     codes: &[u8],
     transposed: bool,
@@ -2127,7 +2115,13 @@ fn scan_pq_range_codes<C: Collector>(
             } else {
                 codes[offset]
             } as usize;
-            distance += table[sub * pq.ksub() + code];
+            let mut entry = table[sub * pq.ksub() + code];
+            if sub == 0 {
+                if let Some(offset) = ip_offset {
+                    entry += offset;
+                }
+            }
+            distance += entry;
         }
         if metric == MetricType::Cosine {
             distance *= 0.5;
@@ -3707,7 +3701,6 @@ mod tests {
                     }
                     assert_eq!(queries[0].table_list, Some(0));
                     assert_eq!(queries[0].table, base_table);
-                    assert_eq!(scratch[0].first_subtable.len(), pq.ksub());
                 }
                 let [query] = queries;
                 assert_eq!(query.collector.scanned(), 5);
@@ -3725,50 +3718,85 @@ mod tests {
     }
 
     #[test]
-    fn pq_range_residual_ip_restores_base_table_after_collector_error() {
+    fn pq_range_residual_ip_preserves_zero_bits_with_and_without_cache() {
         use crate::range::{Bound, DistanceBand};
 
-        let mut pq = ProductQuantizer::with_nbits(2, 2, 8);
-        pq.set_centroids(vec![1.0; 2 * pq.ksub()]);
         let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::InnerProduct)
             .unwrap();
-        let mut queries = [PqRangeQuery::new(
-            0,
-            vec![1.0; 2],
-            MetricType::InnerProduct,
-            RangeCollector::new(band),
-        )];
-        let mut scratch = [PqRangeScratch::default()];
-        let error = scan_pq_range_list(
-            &pq,
-            0,
-            Some(&[f32::MAX; 2]),
-            &[0],
-            &[0; 2],
-            true,
-            None,
-            1,
-            &mut scratch,
-            &mut queries,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(queries[0].table, vec![-1.0; 2 * pq.ksub()]);
-        scan_pq_range_list(
-            &pq,
-            1,
-            Some(&[0.0; 2]),
-            &[1],
-            &[0; 2],
-            true,
-            None,
-            1,
-            &mut scratch,
-            &mut queries,
-        )
-        .unwrap();
-        let [query] = queries;
-        assert_eq!(query.collector.into_rows(), vec![(1, -2.0)]);
+        for bits in [4, 8] {
+            for subquantizers in [1, 2] {
+                let mut pq = ProductQuantizer::with_nbits(subquantizers, subquantizers, bits);
+                pq.set_centroids(vec![1.0; subquantizers * pq.ksub()]);
+                for query_value in [0.0, -0.0] {
+                    for cached_queries in [0, 1] {
+                        for transposed in [false, true] {
+                            let mut queries = [PqRangeQuery::new(
+                                0,
+                                vec![query_value; subquantizers],
+                                MetricType::InnerProduct,
+                                RangeCollector::new(band),
+                            )];
+                            scan_pq_range_list(
+                                &pq,
+                                0,
+                                Some(&vec![1.0; subquantizers]),
+                                &[3, 7],
+                                &vec![0; 2 * pq.code_size()],
+                                transposed,
+                                None,
+                                cached_queries,
+                                &mut [PqRangeScratch::default()],
+                                &mut queries,
+                            )
+                            .unwrap();
+                            let [query] = queries;
+                            assert_eq!(query.collector.scanned(), 2);
+                            let rows = query
+                                .collector
+                                .into_rows()
+                                .into_iter()
+                                .map(|(label, distance)| (label, distance.to_bits()))
+                                .collect::<Vec<_>>();
+                            assert_eq!(rows, vec![(3, 0.0_f32.to_bits()), (7, 0.0_f32.to_bits())]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pq_range_residual_ip_rejects_nonfinite_offsets_with_and_without_cache() {
+        use crate::range::{Bound, DistanceBand};
+
+        let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::InnerProduct)
+            .unwrap();
+        for bits in [4, 8] {
+            let mut pq = ProductQuantizer::with_nbits(2, 2, bits);
+            pq.set_centroids(vec![1.0; 2 * pq.ksub()]);
+            for cached_queries in [0, 1] {
+                let mut queries = [PqRangeQuery::new(
+                    0,
+                    vec![1.0; 2],
+                    MetricType::InnerProduct,
+                    RangeCollector::new(band),
+                )];
+                let error = scan_pq_range_list(
+                    &pq,
+                    0,
+                    Some(&[f32::MAX; 2]),
+                    &[0],
+                    &vec![0; pq.code_size()],
+                    true,
+                    None,
+                    cached_queries,
+                    &mut [PqRangeScratch::default()],
+                    &mut queries,
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
     }
 
     #[test]
@@ -3802,7 +3830,6 @@ mod tests {
             && query.collector.scanned() == 0));
         assert!(scratch[0].table.is_empty());
         assert!(scratch[0].residual_query.is_empty());
-        assert!(scratch[0].first_subtable.is_empty());
     }
 
     #[test]

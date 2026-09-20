@@ -32,6 +32,7 @@
 //! to be safe because squared distances are non-negative, but that is a
 //! coincidence of one metric and should not become the representation for three.
 
+use rayon::prelude::*;
 use std::{borrow::Cow, io};
 
 use crate::distance::{fvec_norm_l2sqr, fvec_normalize, MetricType};
@@ -157,6 +158,8 @@ pub(crate) fn prepare_range_queries(
     Ok(Cow::Owned(normalized))
 }
 
+const PARALLEL_RANGE_MIN_COARSE_COMPONENTS: usize = 128 * 1024;
+
 pub(crate) fn range_probe_lists(
     queries: &[f32],
     centroids: &[f32],
@@ -182,19 +185,26 @@ pub(crate) fn range_probe_lists(
             "non-finite IVF centroid",
         ));
     }
-    queries
-        .chunks_exact(dimension)
-        .map(|query| {
-            kmeans::find_topk_checked(query, centroids, nlist, dimension, nprobe)
-                .map(|lists| lists.into_iter().map(|(_, list)| list).collect())
-                .map_err(|list| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("non-finite query-centroid distance for list {list}"),
-                    )
-                })
-        })
-        .collect()
+    let probe_query = |query: &[f32]| {
+        kmeans::find_topk_checked(query, centroids, nlist, dimension, nprobe)
+            .map(|lists| lists.into_iter().map(|(_, list)| list).collect())
+            .map_err(|list| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-finite query-centroid distance for list {list}"),
+                )
+            })
+    };
+    let query_count = queries.len() / dimension;
+    let coarse_work = query_count.saturating_mul(nlist).saturating_mul(dimension);
+    if query_count > 1 && coarse_work >= PARALLEL_RANGE_MIN_COARSE_COMPONENTS {
+        queries
+            .par_chunks_exact(dimension)
+            .map(probe_query)
+            .collect()
+    } else {
+        queries.chunks_exact(dimension).map(probe_query).collect()
+    }
 }
 
 pub(crate) fn checked_cosine_norm(vector: &[f32]) -> io::Result<f32> {
@@ -695,6 +705,104 @@ impl VectorRangeSearchParams {
 mod tests {
     use super::*;
     use crate::distance::MetricType;
+
+    #[test]
+    fn range_probe_lists_non_l2_preserves_order_and_ties_at_parallel_threshold() {
+        let dimension = 64;
+        let pools = [1, 4].map(|threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+        });
+        for metric in [MetricType::Cosine, MetricType::InnerProduct] {
+            for (query_count, nlist) in [(1, 128), (15, 128), (16, 128), (17, 128), (1, 2048)] {
+                let mut centroids = vec![0.0; nlist * dimension];
+                for list in 0..nlist {
+                    centroids[list * dimension + (list / 2) % dimension] = 1.0;
+                }
+                let mut queries = vec![0.0; query_count * dimension];
+                for query_index in 0..query_count {
+                    queries[query_index * dimension + (query_index * 7 + 3) % dimension] = 1.0;
+                }
+                for nprobe in [1, 3, nlist + 1] {
+                    let expected = (0..query_count)
+                        .map(|query_index| {
+                            let coordinate = (query_index * 7 + 3) % dimension;
+                            (0..nlist)
+                                .filter(|list| (list / 2) % dimension == coordinate)
+                                .chain(
+                                    (0..nlist).filter(|list| (list / 2) % dimension != coordinate),
+                                )
+                                .take(nprobe)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    for pool in &pools {
+                        let actual = pool.install(|| {
+                            range_probe_lists(
+                                &queries, &centroids, dimension, nlist, nprobe, metric,
+                            )
+                            .unwrap()
+                        });
+                        assert_eq!(
+                            actual, expected,
+                            "{metric:?}, {query_count}, {nlist}, {nprobe}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn range_probe_lists_non_l2_parallel_batches_reject_invalid_distances() {
+        let dimension = 64;
+        let nlist = 128;
+        let query_count = 16;
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for metric in [MetricType::Cosine, MetricType::InnerProduct] {
+                for (late_query, far_centroid, diagnostic) in [
+                    (0.0, f32::NAN, "non-finite IVF centroid"),
+                    (0.0, f32::INFINITY, "non-finite IVF centroid"),
+                    (0.0, f32::NEG_INFINITY, "non-finite IVF centroid"),
+                    (1e20, 0.0, "non-finite query-centroid distance for list 0"),
+                    (0.0, 1e20, "non-finite query-centroid distance for list 127"),
+                ] {
+                    let mut queries = vec![0.0f32; query_count * dimension];
+                    queries[(query_count - 1) * dimension] = late_query;
+                    let mut centroids = vec![0.0; nlist * dimension];
+                    centroids[(nlist - 1) * dimension] = far_centroid;
+                    assert!(queries.iter().all(|value| value.is_finite()));
+                    if far_centroid.is_finite() {
+                        assert!(centroids.iter().all(|value| value.is_finite()));
+                    }
+                    if late_query != 0.0 {
+                        assert!(range_probe_lists(
+                            &queries[..(query_count - 1) * dimension],
+                            &centroids,
+                            dimension,
+                            nlist,
+                            1,
+                            metric,
+                        )
+                        .is_ok());
+                    }
+                    let error = pool
+                        .install(|| {
+                            range_probe_lists(&queries, &centroids, dimension, nlist, 1, metric)
+                        })
+                        .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    assert_eq!(error.to_string(), diagnostic);
+                }
+            }
+        }
+    }
 
     // --- Task 3: the band type -------------------------------------------
 

@@ -2178,6 +2178,222 @@ fn serialize_sq(index: &IVFSQIndex) -> Vec<u8> {
     bytes
 }
 
+fn flat_sq_coarse_batch_fixtures(metric: MetricType) -> [Vec<u8>; 2] {
+    let dimension = 64;
+    let nlist = 128;
+    let rows_per_list = 3;
+    let mut flat = IVFFlatIndex::new(dimension, nlist, metric);
+    let mut sq = IVFSQIndex::new(dimension, nlist, metric);
+    sq.sq = ScalarQuantizer::with_bounds(dimension, -0.5, 0.5);
+    sq.list_sqs = vec![sq.sq.clone(); nlist];
+    let mut centroids = vec![0.0; nlist * dimension];
+    for list in 0..nlist {
+        centroids[list * dimension + list / 2] = 1.0;
+    }
+    flat.set_quantizer_centroids(centroids.clone());
+    sq.set_quantizer_centroids(centroids.clone());
+    for list in 0..nlist {
+        for row in 0..rows_per_list {
+            let id = 1000 + (list * rows_per_list + row) as i64;
+            flat.ids[list].push(id);
+            sq.ids[list].push(id);
+            flat.vectors[list].extend(
+                centroids[list * dimension..(list + 1) * dimension]
+                    .iter()
+                    .map(|value| value * (1.0 + row as f32 / 8.0)),
+            );
+            sq.codes[list].extend(
+                (0..dimension).map(|coordinate| ((row * 17 + coordinate * 13) % 256) as u8),
+            );
+        }
+    }
+    [serialize(&flat), serialize_sq(&sq)]
+}
+
+#[test]
+fn flat_sq_non_l2_coarse_parallel_batches_preserve_results_stats_filters_and_reads() {
+    let dimension = 64;
+    for metric in [MetricType::Cosine, MetricType::InnerProduct] {
+        let params = VectorRangeSearchParams::new(
+            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+            2,
+        );
+        for bytes in flat_sq_coarse_batch_fixtures(metric) {
+            let snapshots = [1, 4].map(|threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        let mut snapshots = Vec::new();
+                        for query_count in [15, 16, 17] {
+                            let mut queries = vec![0.0; query_count * dimension];
+                            for query_index in 0..query_count {
+                                queries[query_index * dimension + (query_index * 3) % 4] = 1.0;
+                            }
+                            let reversed = queries
+                                .chunks_exact(dimension)
+                                .rev()
+                                .flatten()
+                                .copied()
+                                .collect::<Vec<_>>();
+                            let trace = Arc::new(Mutex::new(SqReadTrace::default()));
+                            let source = SqRecordingReader {
+                                inner: Cursor::new(bytes.clone()),
+                                trace: Arc::clone(&trace),
+                            };
+                            let mut reader = VectorIndexReader::open_with_options(
+                                source,
+                                VectorIndexReaderOptions::new(0),
+                            )
+                            .unwrap();
+                            match &mut reader {
+                                VectorIndexReader::IvfFlat(reader) => {
+                                    reader.ensure_loaded().unwrap()
+                                }
+                                VectorIndexReader::IvfSq(reader) => reader.ensure_loaded().unwrap(),
+                                _ => unreachable!(),
+                            }
+                            *trace.lock().unwrap() = SqReadTrace::default();
+                            let batch = reader
+                                .range_search_batch(&queries, query_count, params)
+                                .unwrap();
+                            assert_eq!(batch.call_stats().list_reads(), 8);
+                            assert_eq!(trace.lock().unwrap().ranges, 8);
+                            assert_eq!(batch.query_count(), query_count);
+                            let allowed = batch
+                                .labels()
+                                .iter()
+                                .copied()
+                                .filter(|id| id % 2 == 0)
+                                .collect::<HashSet<_>>();
+                            *trace.lock().unwrap() = SqReadTrace::default();
+                            let filtered = reader
+                                .range_search_batch_with_roaring_filter(
+                                    &queries,
+                                    query_count,
+                                    params,
+                                    &serialize_roaring(&allowed),
+                                )
+                                .unwrap();
+                            assert_eq!(filtered.call_stats().list_reads(), 8);
+                            assert_eq!(trace.lock().unwrap().ranges, 8);
+                            let reordered = reader
+                                .range_search_batch(&reversed, query_count, params)
+                                .unwrap();
+                            let rows = (0..query_count)
+                                .map(|query_index| pairs_of(batch.query(query_index)))
+                                .collect::<Vec<_>>();
+                            assert!(rows.windows(2).all(|pair| pair[0] != pair[1]));
+                            for (query_index, query) in queries.chunks_exact(dimension).enumerate()
+                            {
+                                let single = reader.range_search(query, params).unwrap();
+                                assert_eq!(rows[query_index], pairs_of(single.query(0)));
+                                assert_eq!(
+                                    rows[query_index],
+                                    pairs_of(reordered.query(query_count - query_index - 1))
+                                );
+                                let expected_filtered = rows[query_index]
+                                    .iter()
+                                    .copied()
+                                    .filter(|(id, _)| allowed.contains(id))
+                                    .collect::<Vec<_>>();
+                                assert_eq!(
+                                    pairs_of(filtered.query(query_index)),
+                                    expected_filtered
+                                );
+                                for (result, count) in [(&batch, 6), (&filtered, 3)] {
+                                    let result = result.query(query_index);
+                                    assert_eq!(result.labels.len(), count);
+                                    assert_eq!(result.stats.lists_probed(), 2);
+                                    assert_eq!(result.stats.rows_scanned(), count);
+                                    assert_eq!(result.stats.rows_committed(), count);
+                                    assert_eq!(result.stats.early_abandoned(), 0);
+                                }
+                            }
+                            snapshots.push(rows);
+                        }
+                        snapshots
+                    })
+            });
+            assert_eq!(snapshots[0], snapshots[1]);
+        }
+    }
+}
+
+#[test]
+fn flat_sq_non_l2_coarse_parallel_errors_precede_payload_io() {
+    let dimension = 64;
+    let query_count = 16;
+    let empty_filter = serialize_roaring(&HashSet::new());
+    for metric in [MetricType::Cosine, MetricType::InnerProduct] {
+        let params = VectorRangeSearchParams::new(
+            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+            1,
+        );
+        for bytes in flat_sq_coarse_batch_fixtures(metric) {
+            for threads in [1, 4] {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        for (late_query, far_centroid, diagnostic) in [
+                            (0.0, f32::NAN, "non-finite IVF centroid"),
+                            (0.0, f32::INFINITY, "non-finite IVF centroid"),
+                            (0.0, f32::NEG_INFINITY, "non-finite IVF centroid"),
+                            (0.0, 1e20, "non-finite query-centroid distance for list 127"),
+                            (1e20, 1.0, "non-finite query-centroid distance for list 0"),
+                        ] {
+                            if late_query != 0.0 && metric == MetricType::Cosine {
+                                continue;
+                            }
+                            let mut queries = vec![0.0f32; query_count * dimension];
+                            queries[(query_count - 1) * dimension] = late_query;
+                            let trace = Arc::new(Mutex::new(SqReadTrace::default()));
+                            let source = SqRecordingReader {
+                                inner: Cursor::new(bytes.clone()),
+                                trace: Arc::clone(&trace),
+                            };
+                            let mut reader = VectorIndexReader::open(source).unwrap();
+                            let centroids = match &mut reader {
+                                VectorIndexReader::IvfFlat(reader) => {
+                                    reader.ensure_loaded().unwrap();
+                                    &mut reader.quantizer_centroids
+                                }
+                                VectorIndexReader::IvfSq(reader) => {
+                                    reader.ensure_loaded().unwrap();
+                                    &mut reader.quantizer_centroids
+                                }
+                                _ => unreachable!(),
+                            };
+                            *centroids.last_mut().unwrap() = far_centroid;
+                            assert!(queries.iter().all(|value| value.is_finite()));
+                            if far_centroid.is_finite() {
+                                assert!(centroids.iter().all(|value| value.is_finite()));
+                            }
+                            *trace.lock().unwrap() = SqReadTrace::default();
+                            for result in [
+                                reader.range_search_batch(&queries, query_count, params),
+                                reader.range_search_batch_with_roaring_filter(
+                                    &queries,
+                                    query_count,
+                                    params,
+                                    &empty_filter,
+                                ),
+                            ] {
+                                let error = result.unwrap_err();
+                                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                                assert_eq!(error.to_string(), diagnostic);
+                            }
+                            assert_eq!(trace.lock().unwrap().calls, 0);
+                        }
+                    });
+            }
+        }
+    }
+}
+
 #[test]
 fn ivf_sq_range_matches_sq_estimates_for_all_entry_points() {
     let dimension = 65;
