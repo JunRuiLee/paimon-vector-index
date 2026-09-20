@@ -28,7 +28,9 @@ use crate::kmeans::{self, KMeansConfig};
 use crate::logging::{emit_log, LogLevel};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
-use crate::range::{RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams};
+use crate::range::{
+    prepare_range_queries, RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams,
+};
 use crate::sparse_table::SparseTable;
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
@@ -1669,15 +1671,19 @@ pub fn search_with_reader_roaring_filter<R: SeekRead>(
 }
 
 impl<R: SeekRead> IVFPQIndexReader<R> {
-    /// Returns every eligible probed row whose PQ estimate is in the L2 band.
+    /// Returns every eligible probed row whose PQ estimate is in the band.
     ///
-    /// Both code widths use floating-point ADC: direct squared-L2 distances
-    /// from the query (after OPQ and optional coarse residual subtraction) to
-    /// each selected PQ centroid, summed in subquantizer order. Range search
+    /// Both code widths use floating-point ADC, summed in subquantizer order.
+    /// L2 uses direct squared distances from the query (after OPQ and optional
+    /// coarse residual subtraction) to each selected PQ centroid. Range search
     /// does not use top-K's u8 FastScan tables or precomputed norm identities,
-    /// so membership is independent of list size and `optimize_for_search`.
+    /// so membership is independent of list size, batch size and `optimize_for_search`.
     /// This is an estimate of the original vector's distance, even at full
     /// nprobe. Results are uncapped and unordered; top-K is unchanged.
+    /// Cosine normalizes the query before OPQ and returns half the squared-L2
+    /// ADC estimate. Inner product uses negative dot-product tables, including
+    /// the coarse-centroid contribution for residual codes. Neither estimator
+    /// establishes exact membership over the original vectors.
     ///
     /// Non-finite transformed queries, coarse distances, or consumed PQ
     /// distances return `InvalidData`. Filtered-out rows are not evaluated.
@@ -1758,16 +1764,20 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         }
         self.ensure_loaded()?;
         let prepare_query = |(query_index, query): (usize, &[f32])| {
-            let mut prepared = query.to_vec();
-            if let Some(opq) = &self.opq {
-                opq.apply(query, &mut prepared);
-            }
-            if prepared.iter().any(|value| !value.is_finite()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "non-finite IVF-PQ rotated query",
-                ));
-            }
+            let normalized = prepare_range_queries(query, self.d, self.metric)?;
+            let prepared = if let Some(opq) = &self.opq {
+                let mut rotated = normalized.to_vec();
+                opq.apply(normalized.as_ref(), &mut rotated);
+                if rotated.iter().any(|value| !value.is_finite()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "non-finite IVF-PQ rotated query",
+                    ));
+                }
+                rotated
+            } else {
+                normalized.into_owned()
+            };
             let probes = kmeans::find_topk_checked(
                 &prepared,
                 &self.quantizer_centroids,
@@ -1782,7 +1792,12 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 )
             })?;
             Ok((
-                PqRangeQuery::new(query_index, prepared, RangeCollector::new(params.band())),
+                PqRangeQuery::new(
+                    query_index,
+                    prepared,
+                    self.metric,
+                    RangeCollector::new(params.band()),
+                ),
                 probes,
             ))
         };
@@ -1888,7 +1903,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                         list.codes(),
                         self.transposed_codes,
                         filter,
-                        if self.by_residual { 0 } else { cached_queries },
+                        if self.by_residual && self.metric != MetricType::InnerProduct {
+                            0
+                        } else {
+                            cached_queries
+                        },
                         &mut scratch,
                         &mut active_queries,
                     )?;
@@ -1916,21 +1935,24 @@ const PARALLEL_PQ_RANGE_MIN_COARSE_COMPONENTS: usize = 128 * 1024;
 struct PqRangeScratch {
     residual_query: Vec<f32>,
     table: Vec<f32>,
+    first_subtable: Vec<f32>,
 }
 
 struct PqRangeQuery<C> {
     query_index: usize,
     query: Vec<f32>,
+    metric: MetricType,
     collector: C,
     table: Vec<f32>,
     table_list: Option<usize>,
 }
 
 impl<C> PqRangeQuery<C> {
-    fn new(query_index: usize, query: Vec<f32>, collector: C) -> Self {
+    fn new(query_index: usize, query: Vec<f32>, metric: MetricType, collector: C) -> Self {
         Self {
             query_index,
             query,
+            metric,
             collector,
             table: Vec::new(),
             table_list: None,
@@ -1962,39 +1984,61 @@ fn scan_pq_range_list<C: Collector + Send>(
         return Ok(());
     }
     let scan_query = |scratch: &mut PqRangeScratch, query: &mut PqRangeQuery<C>| {
+        let cached_ip_table =
+            query.query_index < cached_queries && query.metric == MetricType::InnerProduct;
+        let table_centroid = centroid.filter(|_| !cached_ip_table);
         let table = if query.query_index < cached_queries {
             if query.table_list.is_none()
-                || (centroid.is_some() && query.table_list != Some(list_id))
+                || (table_centroid.is_some() && query.table_list != Some(list_id))
             {
                 build_pq_range_table(
                     pq,
                     &query.query,
-                    centroid,
+                    query.metric,
+                    table_centroid,
                     &mut scratch.residual_query,
                     &mut query.table,
                 );
                 query.table_list = Some(list_id);
             }
-            &query.table
+            &mut query.table
         } else {
             build_pq_range_table(
                 pq,
                 &query.query,
+                query.metric,
                 centroid,
                 &mut scratch.residual_query,
                 &mut scratch.table,
             );
-            &scratch.table
+            &mut scratch.table
         };
-        scan_pq_range_codes(
+        let ip_offset = centroid
+            .filter(|_| cached_ip_table)
+            .map(|centroid| -fvec_inner_product(&query.query, centroid));
+        if let Some(offset) = ip_offset {
+            scratch.first_subtable.clear();
+            scratch
+                .first_subtable
+                .extend_from_slice(&table[..pq.ksub()]);
+            for entry in &mut table[..pq.ksub()] {
+                *entry += offset;
+            }
+        }
+        let result = scan_pq_range_codes(
             pq,
             table,
+            query.metric,
             ids,
             codes,
             transposed,
             positions.as_ref(),
             &mut query.collector,
-        )
+        );
+        if ip_offset.is_some() {
+            table[..pq.ksub()].copy_from_slice(&scratch.first_subtable);
+        }
+        result
     };
     let matching_count = positions.as_ref().map_or(ids.len(), MatchingRows::len);
     if scratch.len() > 1
@@ -2022,11 +2066,13 @@ fn scan_pq_range_list<C: Collector + Send>(
 fn build_pq_range_table(
     pq: &ProductQuantizer,
     query: &[f32],
+    metric: MetricType,
     centroid: Option<&[f32]>,
     residual_query: &mut Vec<f32>,
     table: &mut Vec<f32>,
 ) {
-    let query = if let Some(centroid) = centroid {
+    let residual_centroid = centroid.filter(|_| metric != MetricType::InnerProduct);
+    let query = if let Some(centroid) = residual_centroid {
         residual_query.resize(query.len(), 0.0);
         for ((residual, value), coarse) in residual_query.iter_mut().zip(query).zip(centroid) {
             *residual = value - coarse;
@@ -2040,8 +2086,19 @@ fn build_pq_range_table(
         let query_chunk = &query[sub * pq.dsub()..(sub + 1) * pq.dsub()];
         for code in 0..pq.ksub() {
             let offset = (sub * pq.ksub() + code) * pq.dsub();
-            table[sub * pq.ksub() + code] =
-                fvec_l2sqr(query_chunk, &pq.centroids()[offset..offset + pq.dsub()]);
+            let codeword = &pq.centroids()[offset..offset + pq.dsub()];
+            table[sub * pq.ksub() + code] = match metric {
+                MetricType::L2 | MetricType::Cosine => fvec_l2sqr(query_chunk, codeword),
+                MetricType::InnerProduct => -fvec_inner_product(query_chunk, codeword),
+            };
+        }
+    }
+    if metric == MetricType::InnerProduct {
+        if let Some(centroid) = centroid {
+            let offset = -fvec_inner_product(query, centroid);
+            for entry in &mut table[..pq.ksub()] {
+                *entry += offset;
+            }
         }
     }
 }
@@ -2049,6 +2106,7 @@ fn build_pq_range_table(
 fn scan_pq_range_codes<C: Collector>(
     pq: &ProductQuantizer,
     table: &[f32],
+    metric: MetricType,
     ids: &[i64],
     codes: &[u8],
     transposed: bool,
@@ -2070,6 +2128,9 @@ fn scan_pq_range_codes<C: Collector>(
                 codes[offset]
             } as usize;
             distance += table[sub * pq.ksub() + code];
+        }
+        if metric == MetricType::Cosine {
+            distance *= 0.5;
         }
         collector.push(ids[row], distance)
     };
@@ -3386,6 +3447,12 @@ mod tests {
 
     #[test]
     fn pq_range_scans_active_queries_on_multiple_workers() {
+        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            check_pq_range_parallel_workers(metric);
+        }
+    }
+
+    fn check_pq_range_parallel_workers(metric: MetricType) {
         struct TrackingCollector<'a> {
             inner: RangeCollector,
             workers: &'a AtomicUsize,
@@ -3416,7 +3483,7 @@ mod tests {
         let band = crate::range::DistanceBand::new(
             crate::range::Bound::Unbounded,
             crate::range::Bound::Unbounded,
-            MetricType::L2,
+            metric,
         )
         .unwrap();
         let workers = AtomicUsize::new(0);
@@ -3427,6 +3494,7 @@ mod tests {
                 PqRangeQuery::new(
                     query_index,
                     queries[query_index].clone(),
+                    metric,
                     TrackingCollector {
                         inner: RangeCollector::new(band),
                         workers: &workers,
@@ -3462,7 +3530,12 @@ mod tests {
         );
         for query in collectors {
             assert_eq!(query.collector.inner.scanned(), ids.len());
-            let distance = 8.0 * (query.query_index * query.query_index) as f32;
+            let squared = 8.0 * (query.query_index * query.query_index) as f32;
+            let distance = match metric {
+                MetricType::L2 => squared,
+                MetricType::Cosine => squared * 0.5,
+                MetricType::InnerProduct => 0.0,
+            };
             for (row, (id, value)) in query.collector.inner.into_rows().into_iter().enumerate() {
                 assert_eq!(value, distance);
                 assert_eq!(id, row as i64);
@@ -3470,11 +3543,14 @@ mod tests {
         }
     }
 
-    fn pq_range_test_queries(count: usize) -> Vec<PqRangeQuery<RangeCollector>> {
+    fn pq_range_test_queries(
+        count: usize,
+        metric: MetricType,
+    ) -> Vec<PqRangeQuery<RangeCollector>> {
         let band = crate::range::DistanceBand::new(
             crate::range::Bound::Unbounded,
             crate::range::Bound::Unbounded,
-            MetricType::L2,
+            metric,
         )
         .unwrap();
         (0..count)
@@ -3483,6 +3559,7 @@ mod tests {
                 PqRangeQuery::new(
                     query_index,
                     vec![query_index as f32 * 0.25; 32],
+                    metric,
                     RangeCollector::new(band),
                 )
             })
@@ -3491,6 +3568,12 @@ mod tests {
 
     #[test]
     fn pq_range_reuses_bounded_tables_without_changing_estimates() {
+        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            check_pq_range_cached_estimates(metric);
+        }
+    }
+
+    fn check_pq_range_cached_estimates(metric: MetricType) {
         for bits in [4, 8] {
             let mut pq = ProductQuantizer::with_nbits(32, 4, bits);
             pq.set_centroids(vec![0.125; 32 * pq.ksub()]);
@@ -3499,8 +3582,8 @@ mod tests {
             assert_eq!(pq_range_cache_query_limit(&pq, table_bytes - 1), 0);
             assert_eq!(pq_range_cache_query_limit(&pq, budget), 2);
             for residual in [false, true] {
-                let mut cached = pq_range_test_queries(5);
-                let mut uncached = pq_range_test_queries(5);
+                let mut cached = pq_range_test_queries(5, metric);
+                let mut uncached = pq_range_test_queries(5, metric);
                 let mut scratch = [PqRangeScratch::default()];
                 let mut reference_scratch = [PqRangeScratch::default()];
                 let mut table_addresses = Vec::new();
@@ -3533,7 +3616,14 @@ mod tests {
                         .iter()
                         .filter(|query| query.query_index < 2)
                         .map(|query| {
-                            assert_eq!(query.table_list, Some(if residual { list_id } else { 0 }));
+                            assert_eq!(
+                                query.table_list,
+                                Some(if residual && metric != MetricType::InnerProduct {
+                                    list_id
+                                } else {
+                                    0
+                                })
+                            );
                             query.table.as_ptr()
                         })
                         .collect::<Vec<_>>();
@@ -3565,11 +3655,134 @@ mod tests {
     }
 
     #[test]
+    fn pq_range_residual_ip_reuses_base_tables_without_reordering_rounding() {
+        use crate::range::{Bound, DistanceBand};
+
+        for bits in [4, 8] {
+            let mut pq = ProductQuantizer::with_nbits(2, 2, bits);
+            let mut centroids = vec![-16_777_216.0; pq.ksub()];
+            centroids.extend(vec![16_777_216.0; pq.ksub()]);
+            pq.set_centroids(centroids);
+            for (lower, upper) in [
+                (Bound::Unbounded, Bound::Unbounded),
+                (Bound::Finite(0.0), Bound::Finite(1.0)),
+                (Bound::Finite(4.0), Bound::Finite(5.0)),
+            ] {
+                let band = DistanceBand::new(lower, upper, MetricType::InnerProduct).unwrap();
+                let mut queries = [PqRangeQuery::new(
+                    0,
+                    vec![1.0; 2],
+                    MetricType::InnerProduct,
+                    RangeCollector::new(band),
+                )];
+                let mut scratch = [PqRangeScratch::default()];
+                let mut base_table = Vec::new();
+                build_pq_range_table(
+                    &pq,
+                    &queries[0].query,
+                    MetricType::InnerProduct,
+                    None,
+                    &mut Vec::new(),
+                    &mut base_table,
+                );
+                let mut expected = Vec::new();
+                for (list_id, offset) in [1.0_f32, 3.0, 1.0, -3.0, 1.0].into_iter().enumerate() {
+                    let ids = [list_id as i64];
+                    scan_pq_range_list(
+                        &pq,
+                        list_id,
+                        Some(&[-offset, 0.0]),
+                        &ids,
+                        &vec![0; pq.code_size()],
+                        true,
+                        None,
+                        1,
+                        &mut scratch,
+                        &mut queries,
+                    )
+                    .unwrap();
+                    let distance = (16_777_216.0_f32 + offset) - 16_777_216.0;
+                    if band.admit(distance) {
+                        expected.push((ids[0], distance.to_bits()));
+                    }
+                    assert_eq!(queries[0].table_list, Some(0));
+                    assert_eq!(queries[0].table, base_table);
+                    assert_eq!(scratch[0].first_subtable.len(), pq.ksub());
+                }
+                let [query] = queries;
+                assert_eq!(query.collector.scanned(), 5);
+                assert_eq!(
+                    query
+                        .collector
+                        .into_rows()
+                        .into_iter()
+                        .map(|(label, distance)| (label, distance.to_bits()))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pq_range_residual_ip_restores_base_table_after_collector_error() {
+        use crate::range::{Bound, DistanceBand};
+
+        let mut pq = ProductQuantizer::with_nbits(2, 2, 8);
+        pq.set_centroids(vec![1.0; 2 * pq.ksub()]);
+        let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::InnerProduct)
+            .unwrap();
+        let mut queries = [PqRangeQuery::new(
+            0,
+            vec![1.0; 2],
+            MetricType::InnerProduct,
+            RangeCollector::new(band),
+        )];
+        let mut scratch = [PqRangeScratch::default()];
+        let error = scan_pq_range_list(
+            &pq,
+            0,
+            Some(&[f32::MAX; 2]),
+            &[0],
+            &[0; 2],
+            true,
+            None,
+            1,
+            &mut scratch,
+            &mut queries,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(queries[0].table, vec![-1.0; 2 * pq.ksub()]);
+        scan_pq_range_list(
+            &pq,
+            1,
+            Some(&[0.0; 2]),
+            &[1],
+            &[0; 2],
+            true,
+            None,
+            1,
+            &mut scratch,
+            &mut queries,
+        )
+        .unwrap();
+        let [query] = queries;
+        assert_eq!(query.collector.into_rows(), vec![(1, -2.0)]);
+    }
+
+    #[test]
     fn pq_range_excluded_rows_do_not_allocate_tables() {
+        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            check_pq_range_excluded_rows(metric);
+        }
+    }
+
+    fn check_pq_range_excluded_rows(metric: MetricType) {
         let pq = ProductQuantizer::with_nbits(32, 4, 8);
         let ids = (0..8193).collect::<Vec<i64>>();
         let codes = vec![0; ids.len() * pq.code_size()];
-        let mut queries = pq_range_test_queries(4);
+        let mut queries = pq_range_test_queries(4, metric);
         let mut scratch = [PqRangeScratch::default()];
         scan_pq_range_list(
             &pq,
@@ -3589,10 +3802,17 @@ mod tests {
             && query.collector.scanned() == 0));
         assert!(scratch[0].table.is_empty());
         assert!(scratch[0].residual_query.is_empty());
+        assert!(scratch[0].first_subtable.is_empty());
     }
 
     #[test]
     fn pq_range_parallel_collector_errors_propagate() {
+        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            check_pq_range_collector_errors(metric);
+        }
+    }
+
+    fn check_pq_range_collector_errors(metric: MetricType) {
         struct FailingCollector;
 
         impl Collector for FailingCollector {
@@ -3610,7 +3830,9 @@ mod tests {
         let ids = (0..8193).collect::<Vec<i64>>();
         let codes = vec![0; ids.len() * pq.code_size()];
         let mut queries = (0..4)
-            .map(|query_index| PqRangeQuery::new(query_index, vec![0.0; 32], FailingCollector))
+            .map(|query_index| {
+                PqRangeQuery::new(query_index, vec![0.0; 32], metric, FailingCollector)
+            })
             .collect::<Vec<_>>();
         let mut scratch = (0..4)
             .map(|_| PqRangeScratch::default())
