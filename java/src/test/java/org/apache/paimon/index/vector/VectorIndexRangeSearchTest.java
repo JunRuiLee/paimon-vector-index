@@ -22,6 +22,7 @@ import static org.apache.paimon.index.vector.VectorDistanceBand.CutOperator.GT;
 import static org.apache.paimon.index.vector.VectorDistanceBand.CutOperator.LE;
 import static org.apache.paimon.index.vector.VectorDistanceBand.CutOperator.LT;
 
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -42,6 +43,7 @@ public class VectorIndexRangeSearchTest {
     }
 
     static void testValueTypes() {
+        testNativeResultOwnership();
         VectorDistanceBand band = new VectorDistanceBand("l2", null, 4.0f);
         check(band.lower() == null && band.upper() == 4.0f, "structural bounds");
         check("l2".equals(band.metric()), "metric");
@@ -138,6 +140,93 @@ public class VectorIndexRangeSearchTest {
         expect(NullPointerException.class, () -> closed.rangeSearch(null, params));
         expect(NullPointerException.class, () -> closed.rangeSearch(new float[1], null));
         expect(NullPointerException.class, () -> closed.rangeSearch(new float[1], params, null));
+    }
+
+    private static void testNativeResultOwnership() {
+        long[] labels = {LABEL_BASE, 7};
+        float[] distances = {1, 3};
+        long[] lims = {0, 0, 2};
+        long[] listsProbed = {0, 1};
+        long[] rowsScanned = {0, 3};
+        long[] rowsCommitted = {0, 2};
+        long[] earlyAbandoned = {0, 1};
+        VectorRangeSearchResult result =
+                VectorRangeSearchResult.fromNative(
+                        labels,
+                        distances,
+                        lims,
+                        listsProbed,
+                        rowsScanned,
+                        rowsCommitted,
+                        earlyAbandoned,
+                        1);
+        checkOwnedArray(result, "labels", labels);
+        checkOwnedArray(result, "distances", distances);
+        checkOwnedArray(result, "lims", lims);
+        checkOwnedArray(result, "listsProbed", listsProbed);
+        checkOwnedArray(result, "rowsScanned", rowsScanned);
+        checkOwnedArray(result, "rowsCommitted", rowsCommitted);
+        checkOwnedArray(result, "earlyAbandoned", earlyAbandoned);
+        result.labels()[0] = -1;
+        result.distances()[0] = -1;
+        result.lims()[1] = 2;
+        result.listsProbed()[1] = -1;
+        result.rowsScanned()[1] = -1;
+        result.rowsCommitted()[1] = -1;
+        result.earlyAbandoned()[1] = -1;
+        result.labelsForQuery(1)[0] = -1;
+        result.distancesForQuery(1)[0] = -1;
+        check(result.queryCount() == 2 && result.listReads() == 1, "owned result shape");
+        check(result.labelsForQuery(0).length == 0, "owned empty query");
+        check(result.labelsForQuery(1)[0] == LABEL_BASE, "owned labels remain defensive");
+        check(result.distancesForQuery(1)[0] == 1, "owned distances remain defensive");
+        check(result.lims()[1] == 0 && result.listsProbed()[1] == 1, "owned CSR and stats");
+        check(
+                result.rowsScanned()[1] == 3
+                        && result.rowsCommitted()[1] == 2
+                        && result.earlyAbandoned()[1] == 1,
+                "owned counters remain defensive");
+        expect(
+                NullPointerException.class,
+                () ->
+                        VectorRangeSearchResult.fromNative(
+                                null, distances, lims, listsProbed, rowsScanned,
+                                rowsCommitted, earlyAbandoned, 1));
+        expect(
+                IllegalArgumentException.class,
+                () ->
+                        VectorRangeSearchResult.fromNative(
+                                labels, distances, new long[] {0, 3, 2}, listsProbed,
+                                rowsScanned, rowsCommitted, earlyAbandoned, 1));
+        expect(
+                IllegalArgumentException.class,
+                () ->
+                        VectorRangeSearchResult.fromNative(
+                                labels, distances, lims, new long[0], rowsScanned,
+                                rowsCommitted, earlyAbandoned, 1));
+        expect(
+                IllegalArgumentException.class,
+                () ->
+                        VectorRangeSearchResult.fromNative(
+                                labels, distances, lims, listsProbed, new long[] {0, -1},
+                                rowsCommitted, earlyAbandoned, 1));
+        expect(
+                IllegalArgumentException.class,
+                () ->
+                        VectorRangeSearchResult.fromNative(
+                                labels, distances, lims, listsProbed, rowsScanned,
+                                rowsCommitted, earlyAbandoned, -1));
+    }
+
+    private static void checkOwnedArray(
+            VectorRangeSearchResult result, String name, Object expected) {
+        try {
+            Field field = VectorRangeSearchResult.class.getDeclaredField(name);
+            field.setAccessible(true);
+            check(field.get(result) == expected, "native result must own " + name + " without copying");
+        } catch (ReflectiveOperationException error) {
+            throw new AssertionError(error);
+        }
     }
 
     static void testNative() {

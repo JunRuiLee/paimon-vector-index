@@ -669,7 +669,6 @@ public:
     RangeSearchResult range_search(
             const float* query, size_t query_len, RangeSearchParams params) {
         std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
-        validate_range_queries(query, query_len, 1);
         PaimonVindexRangeSearchResult* raw = nullptr;
         int status = paimon_vindex_reader_range_search(
             require_open(), query, query_len, params.to_ffi(), &raw);
@@ -684,7 +683,6 @@ public:
             const float* query, size_t query_len, RangeSearchParams params,
             const uint8_t* filter, size_t filter_len) {
         std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
-        validate_range_queries(query, query_len, 1);
         PaimonVindexRangeSearchResult* raw = nullptr;
         int status = paimon_vindex_reader_range_search_with_roaring_filter(
             require_open(), query, query_len, params.to_ffi(), filter, filter_len, &raw);
@@ -700,7 +698,6 @@ public:
     RangeSearchResult range_search_batch(
             const float* queries, size_t queries_len, size_t query_count, RangeSearchParams params) {
         std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
-        validate_range_queries(queries, queries_len, query_count);
         PaimonVindexRangeSearchResult* raw = nullptr;
         int status = paimon_vindex_reader_range_search_batch(
             require_open(), queries, queries_len, query_count, params.to_ffi(), &raw);
@@ -716,7 +713,6 @@ public:
             const float* queries, size_t queries_len, size_t query_count, RangeSearchParams params,
             const uint8_t* filter, size_t filter_len) {
         std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
-        validate_range_queries(queries, queries_len, query_count);
         PaimonVindexRangeSearchResult* raw = nullptr;
         int status = paimon_vindex_reader_range_search_batch_with_roaring_filter(
             require_open(), queries, queries_len, query_count, params.to_ffi(), filter, filter_len, &raw);
@@ -815,21 +811,6 @@ public:
     }
 
 private:
-    void validate_range_queries(const float* queries, size_t queries_len, size_t query_count) const {
-        PaimonVindexMetadata metadata{};
-        check(paimon_vindex_reader_metadata(require_open(), &metadata));
-        if (metadata.dimension != 0 &&
-            query_count > std::numeric_limits<size_t>::max() / metadata.dimension) {
-            throw Error("range query dimensions overflow");
-        }
-        if (queries_len != query_count * metadata.dimension) {
-            throw Error("range query length does not match dimension and query count");
-        }
-        if (queries_len != 0 && !queries) {
-            throw Error("range queries must not be null for a nonempty input");
-        }
-    }
-
     PaimonVindexReaderHandle* require_open() const {
         if (!handle_) throw Error("vector index reader is closed");
         return handle_;

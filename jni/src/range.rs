@@ -207,9 +207,10 @@ fn build_range_result(env: &mut JNIEnv, result: RangeSearchResult) -> Result<job
     let rows_scanned = long_array(env, &rows_scanned, "rowsScanned")?;
     let rows_committed = long_array(env, &rows_committed, "rowsCommitted")?;
     let early_abandoned = long_array(env, &early_abandoned, "earlyAbandoned")?;
-    env.new_object(
+    env.call_static_method(
         "org/apache/paimon/index/vector/VectorRangeSearchResult",
-        "([J[F[J[J[J[J[JJ)V",
+        "fromNative",
+        "([J[F[J[J[J[J[JJ)Lorg/apache/paimon/index/vector/VectorRangeSearchResult;",
         &[
             JValue::Object(&labels),
             JValue::Object(&distances),
@@ -221,6 +222,7 @@ fn build_range_result(env: &mut JNIEnv, result: RangeSearchResult) -> Result<job
             JValue::Long(list_reads),
         ],
     )
+    .and_then(|value| value.l())
     .map(|object| object.into_raw())
     .map_err(|error| error.to_string())
 }

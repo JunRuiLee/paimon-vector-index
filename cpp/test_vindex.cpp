@@ -540,6 +540,36 @@ static void test_range_matrix() {
                 assert_range_error([&] {
                     reader.range_search_batch(nullptr, 0, SIZE_MAX / RANGE_DIMENSION + 1, params);
                 });
+                assert_range_error([&] {
+                    reader.range_search_with_roaring_filter(
+                        nullptr, RANGE_DIMENSION, params, range_filter, sizeof(range_filter));
+                });
+                assert_range_error([&] {
+                    reader.range_search_with_roaring_filter(
+                        std::vector<float>{}, params, range_filter, sizeof(range_filter));
+                });
+                assert_range_error([&] {
+                    reader.range_search_with_roaring_filter(
+                        query.data(), SIZE_MAX, params, range_filter, sizeof(range_filter));
+                });
+                assert_range_error([&] {
+                    reader.range_search_batch_with_roaring_filter(
+                        nullptr, queries.size(), RANGE_QUERY_COUNT, params,
+                        range_filter, sizeof(range_filter));
+                });
+                assert_range_error([&] {
+                    reader.range_search_batch_with_roaring_filter(
+                        queries, 2, params, range_filter, sizeof(range_filter));
+                });
+                assert_range_error([&] {
+                    reader.range_search_batch_with_roaring_filter(
+                        nullptr, 0, 0, params, range_filter, sizeof(range_filter));
+                });
+                assert_range_error([&] {
+                    reader.range_search_batch_with_roaring_filter(
+                        queries.data(), 0, SIZE_MAX / RANGE_DIMENSION + 1, params,
+                        range_filter, sizeof(range_filter));
+                });
                 assert_range_error([&] { reader.range_search_with_roaring_filter(query, params, nullptr, 1); });
                 assert_range_error([&] { reader.range_search_with_roaring_filter(query, params, range_filter, 1); });
                 auto invalid = params;

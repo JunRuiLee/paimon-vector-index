@@ -23,7 +23,8 @@ import java.util.Objects;
 /**
  * CSR range-search output in core scan order, with raw distances and no sorting or top-K cap.
  * IVF-Flat distances are exact; SQ, PQ and RQ return their core distance estimates. Each query
- * occupies [lims[query], lims[query + 1]); all arrays are defensively copied.
+ * occupies [lims[query], lims[query + 1]). Public construction and array access make defensive
+ * copies; native construction takes exclusive ownership of its arrays.
  */
 public final class VectorRangeSearchResult {
 
@@ -36,6 +37,27 @@ public final class VectorRangeSearchResult {
     private final long[] earlyAbandoned;
     private final long listReads;
 
+    static VectorRangeSearchResult fromNative(
+            long[] labels,
+            float[] distances,
+            long[] lims,
+            long[] listsProbed,
+            long[] rowsScanned,
+            long[] rowsCommitted,
+            long[] earlyAbandoned,
+            long listReads) {
+        return new VectorRangeSearchResult(
+                labels,
+                distances,
+                lims,
+                listsProbed,
+                rowsScanned,
+                rowsCommitted,
+                earlyAbandoned,
+                listReads,
+                false);
+    }
+
     public VectorRangeSearchResult(
             long[] labels,
             float[] distances,
@@ -45,9 +67,34 @@ public final class VectorRangeSearchResult {
             long[] rowsCommitted,
             long[] earlyAbandoned,
             long listReads) {
-        this.labels = Objects.requireNonNull(labels, "labels").clone();
-        this.distances = Objects.requireNonNull(distances, "distances").clone();
-        this.lims = Objects.requireNonNull(lims, "lims").clone();
+        this(
+                labels,
+                distances,
+                lims,
+                listsProbed,
+                rowsScanned,
+                rowsCommitted,
+                earlyAbandoned,
+                listReads,
+                true);
+    }
+
+    private VectorRangeSearchResult(
+            long[] labels,
+            float[] distances,
+            long[] lims,
+            long[] listsProbed,
+            long[] rowsScanned,
+            long[] rowsCommitted,
+            long[] earlyAbandoned,
+            long listReads,
+            boolean copyArrays) {
+        Objects.requireNonNull(labels, "labels");
+        Objects.requireNonNull(distances, "distances");
+        Objects.requireNonNull(lims, "lims");
+        this.labels = copyArrays ? labels.clone() : labels;
+        this.distances = copyArrays ? distances.clone() : distances;
+        this.lims = copyArrays ? lims.clone() : lims;
         if (this.labels.length != this.distances.length
                 || this.lims.length == 0
                 || this.lims[0] != 0
@@ -60,10 +107,10 @@ public final class VectorRangeSearchResult {
                 throw new IllegalArgumentException("invalid CSR limits");
             }
         }
-        this.listsProbed = copyCounters(listsProbed, "listsProbed");
-        this.rowsScanned = copyCounters(rowsScanned, "rowsScanned");
-        this.rowsCommitted = copyCounters(rowsCommitted, "rowsCommitted");
-        this.earlyAbandoned = copyCounters(earlyAbandoned, "earlyAbandoned");
+        this.listsProbed = validatedCounters(listsProbed, "listsProbed", copyArrays);
+        this.rowsScanned = validatedCounters(rowsScanned, "rowsScanned", copyArrays);
+        this.rowsCommitted = validatedCounters(rowsCommitted, "rowsCommitted", copyArrays);
+        this.earlyAbandoned = validatedCounters(earlyAbandoned, "earlyAbandoned", copyArrays);
         if (listReads < 0) {
             throw new IllegalArgumentException("listReads must be non-negative");
         }
@@ -130,16 +177,17 @@ public final class VectorRangeSearchResult {
         }
     }
 
-    private long[] copyCounters(long[] counters, String name) {
-        long[] copy = Objects.requireNonNull(counters, name).clone();
-        if (copy.length != queryCount()) {
+    private long[] validatedCounters(long[] counters, String name, boolean copyArrays) {
+        Objects.requireNonNull(counters, name);
+        long[] values = copyArrays ? counters.clone() : counters;
+        if (values.length != queryCount()) {
             throw new IllegalArgumentException(name + " length must equal queryCount");
         }
-        for (long value : copy) {
+        for (long value : values) {
             if (value < 0) {
                 throw new IllegalArgumentException(name + " must be non-negative");
             }
         }
-        return copy;
+        return values;
     }
 }
