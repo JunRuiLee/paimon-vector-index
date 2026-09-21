@@ -26,7 +26,9 @@ use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
 use crate::ivfrq::{build_timing_enabled, log_build_elapsed, log_build_timing, IVFRQIndex};
 use crate::kmeans;
-use crate::range::{RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams};
+use crate::range::{
+    prepare_range_queries, RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams,
+};
 use crate::rq::{
     is_supported_rq_bits, padded_dimension, RQCodeFactors, RQQueryContext, RQQueryTerms,
     RQRotation, RQVectorFactors, RaBitQuantizer, DEFAULT_RQ_ROTATION_ROUNDS, RQ_SCAN_BLOCK_SIZE,
@@ -615,7 +617,7 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
     }
 
     /// Returns every eligible row in the probed lists whose IVF-RQ estimated
-    /// distance is in the requested band. Only squared L2 is supported.
+    /// distance is in the requested band, for L2, cosine or inner product.
     ///
     /// Membership uses the one-bit estimate or, for multi-bit codes, the full
     /// estimate. It does not use top-K's coarse lower-bound or FastScan pruning:
@@ -706,6 +708,16 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         {
             return Err(invalid_data("non-finite IVF-RQ centroid"));
         }
+        let processed = prepare_range_queries(queries, self.d, self.metric)?;
+        let queries = processed.as_ref();
+        let query_norms = if self.metric == MetricType::InnerProduct {
+            queries
+                .chunks_exact(self.d)
+                .map(fvec_norm_l2sqr)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let probe_lists = queries
             .par_chunks_exact(self.d)
             .map(|query| {
@@ -764,10 +776,22 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             }
             let scan_one =
                 |list: &RQReadList, query_index: usize, distance: f32| -> io::Result<()> {
-                    let terms = RQQueryTerms {
-                        g_add: distance,
-                        g_error: distance.sqrt(),
+                    let terms = if self.metric == MetricType::L2 {
+                        RQQueryTerms {
+                            g_add: distance,
+                            g_error: distance.sqrt(),
+                        }
+                    } else {
+                        self.quantizer.query_terms_from_coarse_distance(
+                            distance,
+                            query_norms.get(query_index).copied().unwrap_or(0.0),
+                            self.quantizer_centroid_norms[list.list_id],
+                            self.metric,
+                        )
                     };
+                    if !terms.g_add.is_finite() || !terms.g_error.is_finite() {
+                        return Err(invalid_data("non-finite IVF-RQ query terms"));
+                    }
                     let mut collector = RangeCollector::new(params.band());
                     scan_range_blocked_list(
                         list,
@@ -1706,6 +1730,57 @@ mod tests {
             .collect::<Vec<_>>();
         pairs.sort_unstable();
         pairs
+    }
+
+    #[test]
+    fn ivfrq_range_batch_preserves_metric_query_terms() {
+        use crate::distance::fvec_l2sqr;
+        use crate::range::{Bound, DistanceBand};
+
+        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            for bits in [1, 4] {
+                let mut index = IVFRQIndex::with_bits(13, 1, bits, metric);
+                index.set_quantizer_centroids(vec![0.5; index.d]);
+                index.add(&[1.0; 13], &[7], 1);
+                index.factors[0][0].coarse = RQCodeFactors {
+                    f_add: 0.25,
+                    f_rescale: 0.0,
+                    f_error: 0.0,
+                };
+                index.factors[0][0].full = index.factors[0][0].coarse;
+                let mut bytes = Vec::new();
+                write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+                let mut reader = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+                let queries =
+                    [vec![0.0; index.d], vec![0.25; index.d], vec![-2.0; index.d]].concat();
+                let params = VectorRangeSearchParams::new(
+                    DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+                    1,
+                );
+                let result = reader.range_search_batch(&queries, 3, params).unwrap();
+                let processed = prepare_range_queries(&queries, index.d, metric).unwrap();
+                for (query_index, query) in processed.chunks_exact(index.d).enumerate() {
+                    let distance = fvec_l2sqr(query, index.quantizer_centroids());
+                    let g_add = match metric {
+                        MetricType::L2 => distance,
+                        MetricType::Cosine => 0.5 * distance,
+                        MetricType::InnerProduct => {
+                            -0.5 * (fvec_norm_l2sqr(query)
+                                + fvec_norm_l2sqr(index.quantizer_centroids())
+                                - distance)
+                        }
+                    };
+                    assert_eq!(
+                        range_pairs(&result, query_index),
+                        vec![(7, (0.25 + g_add).to_bits())],
+                        "metric={metric:?}, bits={bits}, query={query_index}"
+                    );
+                    assert_eq!(result.query(query_index).stats.rows_scanned(), 1);
+                    assert_eq!(result.query(query_index).stats.rows_committed(), 1);
+                }
+                assert_eq!(result.call_stats().list_reads(), 1);
+            }
+        }
     }
 
     #[test]

@@ -91,10 +91,10 @@ fn pq_fixture(bits: usize, residual: bool, opq: bool) -> IVFPQIndex {
     index
 }
 
-fn pq_dense_opq_fixture(bits: usize, residual: bool) -> IVFPQIndex {
+fn pq_dense_opq_fixture(bits: usize, residual: bool, metric: MetricType) -> IVFPQIndex {
     let dimension = 64;
     let rows_per_list = 1027;
-    let mut index = IVFPQIndex::with_nbits(dimension, 3, 8, bits, MetricType::L2, true);
+    let mut index = IVFPQIndex::with_nbits(dimension, 3, 8, bits, metric, true);
     index.by_residual = residual;
     index.set_quantizer_centroids(
         (0..index.nlist)
@@ -161,9 +161,10 @@ fn pq_dense_opq_fixture(bits: usize, residual: bool) -> IVFPQIndex {
     index
 }
 
-fn pq_coarse_batch_fixture() -> IVFPQIndex {
-    let fixture = pq_dense_opq_fixture(8, true);
-    let mut index = IVFPQIndex::with_nbits(64, 128, 8, 8, MetricType::L2, true);
+fn pq_coarse_batch_fixture(metric: MetricType) -> IVFPQIndex {
+    let fixture = pq_dense_opq_fixture(8, true, metric);
+    let mut index = IVFPQIndex::with_nbits(64, 128, 8, 8, metric, true);
+    index.by_residual = true;
     let mut centroids = fixture.quantizer_centroids().to_vec();
     centroids.resize(index.nlist * index.d, 1000.0);
     index.set_quantizer_centroids(centroids);
@@ -187,6 +188,27 @@ fn pq_reader(index: &IVFPQIndex) -> Reader {
 }
 
 fn pq_oracle(index: &IVFPQIndex, query: &[f32], nprobe: usize) -> Vec<(i64, f32)> {
+    pq_scalar_oracle(index, query, nprobe)
+        .into_iter()
+        .map(|(id, distance, _)| (id, distance))
+        .collect()
+}
+
+fn pq_scalar_oracle(index: &IVFPQIndex, query: &[f32], nprobe: usize) -> Vec<(i64, f32, f32)> {
+    let mut prepared = query.to_vec();
+    if index.metric == MetricType::Cosine {
+        let norm = prepared
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        if norm > 0.0 {
+            for value in &mut prepared {
+                *value /= norm;
+            }
+        }
+    }
+    let query = prepared.as_slice();
     let mut rotated = query.to_vec();
     if let Some(rotation) = &index.opq {
         for (dim, value) in rotated.iter_mut().enumerate() {
@@ -214,6 +236,7 @@ fn pq_oracle(index: &IVFPQIndex, query: &[f32], nprobe: usize) -> Vec<(i64, f32)
             let code =
                 &index.codes[list][row * index.pq.code_size()..(row + 1) * index.pq.code_size()];
             let mut distance = 0.0;
+            let mut absolute_terms = 0.0;
             for sub in 0..index.pq.m() {
                 let label = if index.pq.nbits() == 4 {
                     (code[sub / 2] >> (4 * (sub % 2))) & 15
@@ -230,14 +253,36 @@ fn pq_oracle(index: &IVFPQIndex, query: &[f32], nprobe: usize) -> Vec<(i64, f32)
                     };
                     let centroid = index.pq.centroids()
                         [(sub * index.pq.ksub() + label) * index.pq.dsub() + dim];
-                    term += (rotated[coordinate] - coarse - centroid).powi(2);
+                    let contribution = match index.metric {
+                        MetricType::L2 | MetricType::Cosine => {
+                            (rotated[coordinate] - coarse - centroid).powi(2)
+                        }
+                        MetricType::InnerProduct => -rotated[coordinate] * centroid,
+                    };
+                    term += contribution;
+                    absolute_terms += contribution.abs();
+                }
+                if sub == 0 && index.by_residual && index.metric == MetricType::InnerProduct {
+                    term -= rotated
+                        .iter()
+                        .zip(&index.quantizer_centroids()[list * index.d..(list + 1) * index.d])
+                        .map(|(value, coarse)| {
+                            let contribution = value * coarse;
+                            absolute_terms += contribution.abs();
+                            contribution
+                        })
+                        .sum::<f32>();
                 }
                 distance += term;
             }
-            rows.push((id, distance));
+            if index.metric == MetricType::Cosine {
+                distance *= 0.5;
+                absolute_terms *= 0.5;
+            }
+            rows.push((id, distance, absolute_terms));
         }
     }
-    rows.sort_by_key(|&(id, _)| id);
+    rows.sort_by_key(|&(id, _, _)| id);
     rows
 }
 
@@ -301,6 +346,12 @@ fn pq_range_matches_decoded_oracle_for_both_code_widths() {
 
 #[test]
 fn pq_range_dense_opq_parallel_batches_preserve_float_adc_results() {
+    for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+        check_pq_range_dense_opq(metric);
+    }
+}
+
+fn check_pq_range_dense_opq(metric: MetricType) {
     let pools = [1, 4].map(|threads| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -310,7 +361,7 @@ fn pq_range_dense_opq_parallel_batches_preserve_float_adc_results() {
     let query_count = 16;
     for bits in [4, 8] {
         for residual in [false, true] {
-            let index = pq_dense_opq_fixture(bits, residual);
+            let index = pq_dense_opq_fixture(bits, residual, metric);
             assert!(index.pq.dsub() >= 8);
             let dimension = index.d;
             let queries = (0..query_count)
@@ -337,7 +388,10 @@ fn pq_range_dense_opq_parallel_batches_preserve_float_adc_results() {
                 ids.iter().filter(|id| allowed.contains(id)).count() * query_count > 8192
             }));
             let filter = serialize_roaring(&allowed);
-            let params = pq_all_params(index.nlist);
+            let params = VectorRangeSearchParams::new(
+                DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+                index.nlist,
+            );
             let bytes = pq_bytes(&index);
             let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
             let reference = pools[0].install(|| {
@@ -347,16 +401,15 @@ fn pq_range_dense_opq_parallel_batches_preserve_float_adc_results() {
                     .collect::<Vec<_>>()
             });
             for (query_index, query) in queries.chunks_exact(dimension).enumerate() {
-                let expected = pq_oracle(&index, query, index.nlist);
+                let expected = pq_scalar_oracle(&index, query, index.nlist);
                 assert_eq!(reference[query_index].len(), expected.len());
-                for (&(id, distance), &(expected_id, expected_distance)) in
+                for (&(id, distance), &(expected_id, expected_distance, absolute_terms)) in
                     reference[query_index].iter().zip(&expected)
                 {
                     assert_eq!(id, expected_id);
                     assert!(
-                        (distance - expected_distance).abs()
-                            <= 1e-5 * expected_distance.abs().max(1.0),
-                        "PQ{bits}, residual={residual}, query={query_index}, id={id}: \
+                        (distance - expected_distance).abs() <= 1e-5 * absolute_terms.max(1.0),
+                        "PQ{bits}, {metric:?}, residual={residual}, query={query_index}, id={id}: \
                          SIMD distance {distance}, scalar oracle {expected_distance}"
                     );
                 }
@@ -370,10 +423,12 @@ fn pq_range_dense_opq_parallel_batches_preserve_float_adc_results() {
             assert!(distances[0] < cut && cut < *distances.last().unwrap());
             let bands = [
                 params.band(),
-                DistanceBand::new(Bound::Unbounded, Bound::Finite(cut), MetricType::L2).unwrap(),
-                DistanceBand::new(Bound::Finite(cut), Bound::Unbounded, MetricType::L2).unwrap(),
-                l2(cut, cut.next_up()),
-                l2(cut.next_down(), cut),
+                DistanceBand::new(Bound::Unbounded, Bound::Finite(cut), metric).unwrap(),
+                DistanceBand::new(Bound::Finite(cut), Bound::Unbounded, metric).unwrap(),
+                DistanceBand::new(Bound::Finite(cut), Bound::Finite(cut.next_up()), metric)
+                    .unwrap(),
+                DistanceBand::new(Bound::Finite(cut.next_down()), Bound::Finite(cut), metric)
+                    .unwrap(),
             ];
             for pool in &pools {
                 pool.install(|| {
@@ -449,7 +504,13 @@ fn pq_range_dense_opq_parallel_batches_preserve_float_adc_results() {
 
 #[test]
 fn pq_range_coarse_parallel_partial_probes_preserve_query_order() {
-    let index = pq_coarse_batch_fixture();
+    for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+        check_pq_coarse_parallel(metric);
+    }
+}
+
+fn check_pq_coarse_parallel(metric: MetricType) {
+    let index = pq_coarse_batch_fixture(metric);
     let query_count = 16;
     let queries = (0..query_count)
         .flat_map(|query_index| {
@@ -468,7 +529,10 @@ fn pq_range_coarse_parallel_partial_probes_preserve_query_order() {
         .flatten()
         .copied()
         .collect::<Vec<_>>();
-    let params = pq_all_params(2);
+    let params = VectorRangeSearchParams::new(
+        DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+        2,
+    );
     let snapshots = [1, 4].map(|threads| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -495,16 +559,15 @@ fn pq_range_coarse_parallel_partial_probes_preserve_query_order() {
                         pq_rows(reordered.query(query_count - 1 - query_index))
                     );
                     assert_eq!(batch.query(query_index).stats.lists_probed(), 2);
-                    let expected = pq_oracle(&index, query, 2);
+                    let expected = pq_scalar_oracle(&index, query, 2);
                     assert_eq!(rows[query_index].len(), 14);
                     assert_eq!(rows[query_index].len(), expected.len());
-                    for (&(id, distance), &(expected_id, expected_distance)) in
+                    for (&(id, distance), &(expected_id, expected_distance, absolute_terms)) in
                         rows[query_index].iter().zip(&expected)
                     {
                         assert_eq!(id, expected_id);
                         assert!(
-                            (distance - expected_distance).abs()
-                                <= 1e-5 * expected_distance.abs().max(1.0)
+                            (distance - expected_distance).abs() <= 1e-5 * absolute_terms.max(1.0)
                         );
                     }
                 }
@@ -517,7 +580,7 @@ fn pq_range_coarse_parallel_partial_probes_preserve_query_order() {
 
 #[test]
 fn pq_range_coarse_parallel_overflow_precedes_payload_io() {
-    let index = pq_coarse_batch_fixture();
+    let index = pq_coarse_batch_fixture(MetricType::L2);
     let query_count = 16;
     let params = pq_all_params(1);
     let empty_filter = serialize_roaring(&HashSet::new());
@@ -800,7 +863,7 @@ fn pq_range_empty_bands_validate_before_skipping_metadata_io() {
 }
 
 #[test]
-fn pq_range_metric_mismatch_and_uncertified_metrics_fail_loud() {
+fn pq_range_validates_metric_and_nprobe_even_for_empty_bands() {
     let filter = serialize_roaring(&HashSet::new());
     for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
         let mut index = pq_fixture(8, false, false);
@@ -818,8 +881,6 @@ fn pq_range_metric_mismatch_and_uncertified_metrics_fail_loud() {
                 {
                     if nprobe == 0 || metric != band_metric {
                         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
-                    } else if metric != MetricType::L2 {
-                        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
                     } else {
                         assert!(result.is_ok());
                     }
@@ -992,11 +1053,16 @@ impl SeekRead for PqStreamingSource {
     }
 }
 
-fn pq_streaming_source(bits: usize, corrupt_first_code: bool) -> PqStreamingSource {
+fn pq_streaming_source(
+    bits: usize,
+    corrupt_first_code: bool,
+    metric: MetricType,
+    residual: bool,
+) -> PqStreamingSource {
     let dimension = 256;
-    let mut index = IVFPQIndex::with_nbits(dimension, 1, dimension, bits, MetricType::L2, false);
-    index.by_residual = false;
-    index.set_quantizer_centroids(vec![0.0; dimension]);
+    let mut index = IVFPQIndex::with_nbits(dimension, 1, dimension, bits, metric, false);
+    index.by_residual = residual;
+    index.set_quantizer_centroids(vec![if residual { 0.25 } else { 0.0 }; dimension]);
     index.pq.set_centroids(
         (0..dimension * index.pq.ksub())
             .map(|position| (position % index.pq.ksub()) as f32)
@@ -1031,6 +1097,17 @@ fn pq_streaming_source(bits: usize, corrupt_first_code: bool) -> PqStreamingSour
 
 #[test]
 fn pq_range_streams_oversized_lists_once_and_propagates_collector_errors() {
+    for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+        check_pq_range_streaming(metric, false);
+    }
+}
+
+#[test]
+fn pq_range_streams_residual_ip_across_table_cache_budget() {
+    check_pq_range_streaming(MetricType::InnerProduct, true);
+}
+
+fn check_pq_range_streaming(metric: MetricType, residual: bool) {
     let pools = [1, 4].map(|threads| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -1040,13 +1117,16 @@ fn pq_range_streams_oversized_lists_once_and_propagates_collector_errors() {
     let query_count = 33;
     let selected_prefix_rows = 257;
     assert!(query_count * selected_prefix_rows > 8192);
-    assert!(query_count * 256 * 256 * size_of::<f32>() > 8 * 1024 * 1024);
     let queries = (0..query_count)
         .flat_map(|query| vec![(query + 1) as f32 / 64.0; 256])
         .collect::<Vec<_>>();
     for bits in [4, 8] {
+        assert_eq!(
+            query_count * 256 * (1 << bits) * size_of::<f32>() > 8 * 1024 * 1024,
+            bits == 8
+        );
         for corrupt in [false, true] {
-            let source = pq_streaming_source(bits, corrupt);
+            let source = pq_streaming_source(bits, corrupt, metric, residual);
             let rows = source.rows;
             let code_start = source.prefix.len();
             let code_bytes = rows * source.code_size;
@@ -1063,7 +1143,10 @@ fn pq_range_streams_oversized_lists_once_and_propagates_collector_errors() {
                     let outcome = reader.range_search_batch_with_roaring_filter(
                         &queries,
                         query_count,
-                        pq_all_params(1),
+                        VectorRangeSearchParams::new(
+                            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+                            1,
+                        ),
                         &filter,
                     );
                     let payload_reads = reads
@@ -1100,10 +1183,20 @@ fn pq_range_streams_oversized_lists_once_and_propagates_collector_errors() {
                         assert_eq!(result.call_stats().list_reads(), 1);
                         assert_eq!(result.query_count(), query_count);
                         for (query_index, query) in queries.chunks_exact(256).enumerate() {
+                            let centroid = if residual { 0.25 } else { 0.0 };
+                            let estimate = |codeword: f32| match metric {
+                                MetricType::L2 => 256.0 * (query[0] - centroid - codeword).powi(2),
+                                MetricType::Cosine => {
+                                    128.0 * (0.0625 - centroid - codeword).powi(2)
+                                }
+                                MetricType::InnerProduct => {
+                                    -256.0 * query[0] * (codeword + centroid)
+                                }
+                            };
                             let mut expected = (0..selected_prefix_rows as i64)
-                                .map(|id| (id, 256.0 * query[0].powi(2)))
+                                .map(|id| (id, estimate(0.0)))
                                 .collect::<Vec<_>>();
-                            expected.push((rows as i64 - 1, 256.0 * (query[0] - 1.0).powi(2)));
+                            expected.push((rows as i64 - 1, estimate(1.0)));
                             assert_eq!(pq_rows(result.query(query_index)), expected);
                             let stats = result.query(query_index).stats;
                             assert_eq!(stats.rows_scanned(), allowed.len());
@@ -1731,19 +1824,17 @@ fn rq_range_unified_metric_capability_and_validation_precedence() {
             DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), metric).unwrap(),
         ] {
             let params = VectorRangeSearchParams::new(band, 1);
-            for error in [
-                reader.range_search(&[1.0; 13], params).unwrap_err(),
-                reader
-                    .range_search_batch(&[1.0; 26], 2, params)
-                    .unwrap_err(),
+            for result in [
+                reader.range_search(&[1.0; 13], params).unwrap(),
+                reader.range_search_batch(&[1.0; 26], 2, params).unwrap(),
                 reader
                     .range_search_with_roaring_filter(&[1.0; 13], params, &filter)
-                    .unwrap_err(),
+                    .unwrap(),
                 reader
                     .range_search_batch_with_roaring_filter(&[1.0; 26], 2, params, &filter)
-                    .unwrap_err(),
+                    .unwrap(),
             ] {
-                assert_eq!(error.kind(), ErrorKind::Unsupported);
+                assert_eq!(result.query(0).labels.len(), usize::from(!band.is_empty()));
             }
             assert_eq!(
                 reader
@@ -2085,6 +2176,222 @@ fn serialize_sq(index: &IVFSQIndex) -> Vec<u8> {
     let mut bytes = Vec::new();
     write_ivfsq_index(index, &mut PosWriter::new(&mut bytes)).unwrap();
     bytes
+}
+
+fn flat_sq_coarse_batch_fixtures(metric: MetricType) -> [Vec<u8>; 2] {
+    let dimension = 64;
+    let nlist = 128;
+    let rows_per_list = 3;
+    let mut flat = IVFFlatIndex::new(dimension, nlist, metric);
+    let mut sq = IVFSQIndex::new(dimension, nlist, metric);
+    sq.sq = ScalarQuantizer::with_bounds(dimension, -0.5, 0.5);
+    sq.list_sqs = vec![sq.sq.clone(); nlist];
+    let mut centroids = vec![0.0; nlist * dimension];
+    for list in 0..nlist {
+        centroids[list * dimension + list / 2] = 1.0;
+    }
+    flat.set_quantizer_centroids(centroids.clone());
+    sq.set_quantizer_centroids(centroids.clone());
+    for list in 0..nlist {
+        for row in 0..rows_per_list {
+            let id = 1000 + (list * rows_per_list + row) as i64;
+            flat.ids[list].push(id);
+            sq.ids[list].push(id);
+            flat.vectors[list].extend(
+                centroids[list * dimension..(list + 1) * dimension]
+                    .iter()
+                    .map(|value| value * (1.0 + row as f32 / 8.0)),
+            );
+            sq.codes[list].extend(
+                (0..dimension).map(|coordinate| ((row * 17 + coordinate * 13) % 256) as u8),
+            );
+        }
+    }
+    [serialize(&flat), serialize_sq(&sq)]
+}
+
+#[test]
+fn flat_sq_non_l2_coarse_parallel_batches_preserve_results_stats_filters_and_reads() {
+    let dimension = 64;
+    for metric in [MetricType::Cosine, MetricType::InnerProduct] {
+        let params = VectorRangeSearchParams::new(
+            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+            2,
+        );
+        for bytes in flat_sq_coarse_batch_fixtures(metric) {
+            let snapshots = [1, 4].map(|threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        let mut snapshots = Vec::new();
+                        for query_count in [15, 16, 17] {
+                            let mut queries = vec![0.0; query_count * dimension];
+                            for query_index in 0..query_count {
+                                queries[query_index * dimension + (query_index * 3) % 4] = 1.0;
+                            }
+                            let reversed = queries
+                                .chunks_exact(dimension)
+                                .rev()
+                                .flatten()
+                                .copied()
+                                .collect::<Vec<_>>();
+                            let trace = Arc::new(Mutex::new(SqReadTrace::default()));
+                            let source = SqRecordingReader {
+                                inner: Cursor::new(bytes.clone()),
+                                trace: Arc::clone(&trace),
+                            };
+                            let mut reader = VectorIndexReader::open_with_options(
+                                source,
+                                VectorIndexReaderOptions::new(0),
+                            )
+                            .unwrap();
+                            match &mut reader {
+                                VectorIndexReader::IvfFlat(reader) => {
+                                    reader.ensure_loaded().unwrap()
+                                }
+                                VectorIndexReader::IvfSq(reader) => reader.ensure_loaded().unwrap(),
+                                _ => unreachable!(),
+                            }
+                            *trace.lock().unwrap() = SqReadTrace::default();
+                            let batch = reader
+                                .range_search_batch(&queries, query_count, params)
+                                .unwrap();
+                            assert_eq!(batch.call_stats().list_reads(), 8);
+                            assert_eq!(trace.lock().unwrap().ranges, 8);
+                            assert_eq!(batch.query_count(), query_count);
+                            let allowed = batch
+                                .labels()
+                                .iter()
+                                .copied()
+                                .filter(|id| id % 2 == 0)
+                                .collect::<HashSet<_>>();
+                            *trace.lock().unwrap() = SqReadTrace::default();
+                            let filtered = reader
+                                .range_search_batch_with_roaring_filter(
+                                    &queries,
+                                    query_count,
+                                    params,
+                                    &serialize_roaring(&allowed),
+                                )
+                                .unwrap();
+                            assert_eq!(filtered.call_stats().list_reads(), 8);
+                            assert_eq!(trace.lock().unwrap().ranges, 8);
+                            let reordered = reader
+                                .range_search_batch(&reversed, query_count, params)
+                                .unwrap();
+                            let rows = (0..query_count)
+                                .map(|query_index| pairs_of(batch.query(query_index)))
+                                .collect::<Vec<_>>();
+                            assert!(rows.windows(2).all(|pair| pair[0] != pair[1]));
+                            for (query_index, query) in queries.chunks_exact(dimension).enumerate()
+                            {
+                                let single = reader.range_search(query, params).unwrap();
+                                assert_eq!(rows[query_index], pairs_of(single.query(0)));
+                                assert_eq!(
+                                    rows[query_index],
+                                    pairs_of(reordered.query(query_count - query_index - 1))
+                                );
+                                let expected_filtered = rows[query_index]
+                                    .iter()
+                                    .copied()
+                                    .filter(|(id, _)| allowed.contains(id))
+                                    .collect::<Vec<_>>();
+                                assert_eq!(
+                                    pairs_of(filtered.query(query_index)),
+                                    expected_filtered
+                                );
+                                for (result, count) in [(&batch, 6), (&filtered, 3)] {
+                                    let result = result.query(query_index);
+                                    assert_eq!(result.labels.len(), count);
+                                    assert_eq!(result.stats.lists_probed(), 2);
+                                    assert_eq!(result.stats.rows_scanned(), count);
+                                    assert_eq!(result.stats.rows_committed(), count);
+                                    assert_eq!(result.stats.early_abandoned(), 0);
+                                }
+                            }
+                            snapshots.push(rows);
+                        }
+                        snapshots
+                    })
+            });
+            assert_eq!(snapshots[0], snapshots[1]);
+        }
+    }
+}
+
+#[test]
+fn flat_sq_non_l2_coarse_parallel_errors_precede_payload_io() {
+    let dimension = 64;
+    let query_count = 16;
+    let empty_filter = serialize_roaring(&HashSet::new());
+    for metric in [MetricType::Cosine, MetricType::InnerProduct] {
+        let params = VectorRangeSearchParams::new(
+            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+            1,
+        );
+        for bytes in flat_sq_coarse_batch_fixtures(metric) {
+            for threads in [1, 4] {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        for (late_query, far_centroid, diagnostic) in [
+                            (0.0, f32::NAN, "non-finite IVF centroid"),
+                            (0.0, f32::INFINITY, "non-finite IVF centroid"),
+                            (0.0, f32::NEG_INFINITY, "non-finite IVF centroid"),
+                            (0.0, 1e20, "non-finite query-centroid distance for list 127"),
+                            (1e20, 1.0, "non-finite query-centroid distance for list 0"),
+                        ] {
+                            if late_query != 0.0 && metric == MetricType::Cosine {
+                                continue;
+                            }
+                            let mut queries = vec![0.0f32; query_count * dimension];
+                            queries[(query_count - 1) * dimension] = late_query;
+                            let trace = Arc::new(Mutex::new(SqReadTrace::default()));
+                            let source = SqRecordingReader {
+                                inner: Cursor::new(bytes.clone()),
+                                trace: Arc::clone(&trace),
+                            };
+                            let mut reader = VectorIndexReader::open(source).unwrap();
+                            let centroids = match &mut reader {
+                                VectorIndexReader::IvfFlat(reader) => {
+                                    reader.ensure_loaded().unwrap();
+                                    &mut reader.quantizer_centroids
+                                }
+                                VectorIndexReader::IvfSq(reader) => {
+                                    reader.ensure_loaded().unwrap();
+                                    &mut reader.quantizer_centroids
+                                }
+                                _ => unreachable!(),
+                            };
+                            *centroids.last_mut().unwrap() = far_centroid;
+                            assert!(queries.iter().all(|value| value.is_finite()));
+                            if far_centroid.is_finite() {
+                                assert!(centroids.iter().all(|value| value.is_finite()));
+                            }
+                            *trace.lock().unwrap() = SqReadTrace::default();
+                            for result in [
+                                reader.range_search_batch(&queries, query_count, params),
+                                reader.range_search_batch_with_roaring_filter(
+                                    &queries,
+                                    query_count,
+                                    params,
+                                    &empty_filter,
+                                ),
+                            ] {
+                                let error = result.unwrap_err();
+                                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                                assert_eq!(error.to_string(), diagnostic);
+                            }
+                            assert_eq!(trace.lock().unwrap().calls, 0);
+                        }
+                    });
+            }
+        }
+    }
 }
 
 #[test]
@@ -2478,7 +2785,7 @@ fn ivf_sq_range_streams_oversized_lists_for_single_batch_and_filter() {
 
 #[test]
 fn ivf_sq_range_batch_validates_inputs_before_empty_band_shortcuts() {
-    use std::io::ErrorKind::{InvalidInput, Unsupported};
+    use std::io::ErrorKind::InvalidInput;
 
     for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
         let mut index = build_sq_index(33, 35, 2);
@@ -2519,12 +2826,8 @@ fn ivf_sq_range_batch_validates_inputs_before_empty_band_shortcuts() {
                 .kind(),
             InvalidInput
         );
-        let result = reader.range_search_batch(&query, 1, params);
-        if metric == MetricType::L2 {
-            assert!(result.unwrap().labels().is_empty());
-        } else {
-            assert_eq!(result.unwrap_err().kind(), Unsupported);
-        }
+        let result = reader.range_search_batch(&query, 1, params).unwrap();
+        assert!(result.labels().is_empty());
     }
 }
 
@@ -2636,15 +2939,8 @@ fn a_band_whose_metric_disagrees_with_the_index_is_rejected() {
                     std::io::ErrorKind::InvalidInput,
                     "index {index_metric:?} / band {band_metric:?} must report InvalidInput"
                 );
-            } else if band_metric != MetricType::L2 {
-                // Matching but not yet certified.
-                assert_eq!(
-                    outcome.unwrap_err().kind(),
-                    std::io::ErrorKind::Unsupported,
-                    "index {index_metric:?} / band {band_metric:?}"
-                );
             } else {
-                assert!(outcome.is_ok(), "L2/L2 must succeed");
+                assert!(outcome.is_ok(), "matching metrics must succeed");
             }
         }
     }
@@ -3546,11 +3842,10 @@ fn a_zero_nprobe_outranks_the_metric_capability_gap() {
         "nprobe == 0 must be reported before the uncertified-metric gap"
     );
 
-    // With a valid nprobe the metric gap is what is left to report.
-    let err = cosine_reader
+    let result = cosine_reader
         .range_search(&[0.0; 8], VectorRangeSearchParams::new(cosine_band, 4))
-        .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        .unwrap();
+    assert!(result.labels().is_empty());
 }
 
 /// Builds a single-list index whose payload exceeds the 64 MiB threshold that
