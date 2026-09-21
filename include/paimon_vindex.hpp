@@ -25,8 +25,10 @@ extern "C" {
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -223,6 +225,79 @@ struct SearchResult {
     std::vector<int64_t> ids;
     std::vector<float> distances;
 };
+
+using DistanceEndpoint = PaimonVindexDistanceEndpoint;
+using RangeSearchStats = PaimonVindexRangeSearchStats;
+
+struct DistanceBand {
+    uint32_t metric = PAIMON_VINDEX_METRIC_L2;
+    uint32_t lower_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
+    float lower = 0.0f;
+    uint32_t upper_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
+    float upper = 0.0f;
+
+    static DistanceBand from_endpoints(
+            uint32_t metric,
+            std::optional<DistanceEndpoint> lower = std::nullopt,
+            std::optional<DistanceEndpoint> upper = std::nullopt) {
+        PaimonVindexDistanceBand raw{};
+        check(paimon_vindex_distance_band_from_endpoints(
+            metric, lower ? &*lower : nullptr, upper ? &*upper : nullptr, &raw));
+        return {raw.metric, raw.lower_kind, raw.lower, raw.upper_kind, raw.upper};
+    }
+
+    PaimonVindexDistanceBand to_ffi() const {
+        return {metric, lower_kind, lower, upper_kind, upper};
+    }
+};
+
+struct RangeSearchParams {
+    DistanceBand band;
+    size_t nprobe = 1;
+
+    PaimonVindexRangeSearchParams to_ffi() const {
+        return {band.to_ffi(), nprobe};
+    }
+};
+
+struct RangeSearchResult {
+    size_t query_count = 0;
+    std::vector<size_t> lims;
+    std::vector<int64_t> labels;
+    std::vector<float> distances;
+    std::vector<RangeSearchStats> stats;
+    size_t list_reads = 0;
+};
+
+namespace detail {
+
+inline RangeSearchResult copy_range_result(PaimonVindexRangeSearchResult* raw, int status) {
+    std::unique_ptr<PaimonVindexRangeSearchResult,
+                    decltype(&paimon_vindex_range_search_result_destroy)> guard(
+        raw, &paimon_vindex_range_search_result_destroy);
+    check(status);
+    PaimonVindexRangeSearchResultView view{};
+    check(paimon_vindex_range_search_result_view(guard.get(), &view));
+    if (view.query_count == std::numeric_limits<size_t>::max() || !view.lims ||
+        (view.hit_count != 0 && (!view.labels || !view.distances)) ||
+        (view.query_count != 0 && !view.stats)) {
+        throw Error("invalid native range result view");
+    }
+    RangeSearchResult result;
+    result.query_count = view.query_count;
+    result.lims.assign(view.lims, view.lims + view.query_count + 1);
+    if (view.hit_count != 0) {
+        result.labels.assign(view.labels, view.labels + view.hit_count);
+        result.distances.assign(view.distances, view.distances + view.hit_count);
+    }
+    if (view.query_count != 0) {
+        result.stats.assign(view.stats, view.stats + view.query_count);
+    }
+    result.list_reads = view.list_reads;
+    return result;
+}
+
+}
 
 struct SearchParams {
     size_t top_k = 0;
@@ -584,6 +659,77 @@ public:
         return result;
     }
 
+    bool supports_range_search() const {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        int supported = 0;
+        check(paimon_vindex_reader_supports_range_search(require_open(), &supported));
+        return supported != 0;
+    }
+
+    RangeSearchResult range_search(
+            const float* query, size_t query_len, RangeSearchParams params) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        validate_range_queries(query, query_len, 1);
+        PaimonVindexRangeSearchResult* raw = nullptr;
+        int status = paimon_vindex_reader_range_search(
+            require_open(), query, query_len, params.to_ffi(), &raw);
+        return detail::copy_range_result(raw, status);
+    }
+
+    RangeSearchResult range_search(const std::vector<float>& query, RangeSearchParams params) {
+        return range_search(query.data(), query.size(), params);
+    }
+
+    RangeSearchResult range_search_with_roaring_filter(
+            const float* query, size_t query_len, RangeSearchParams params,
+            const uint8_t* filter, size_t filter_len) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        validate_range_queries(query, query_len, 1);
+        PaimonVindexRangeSearchResult* raw = nullptr;
+        int status = paimon_vindex_reader_range_search_with_roaring_filter(
+            require_open(), query, query_len, params.to_ffi(), filter, filter_len, &raw);
+        return detail::copy_range_result(raw, status);
+    }
+
+    RangeSearchResult range_search_with_roaring_filter(
+            const std::vector<float>& query, RangeSearchParams params,
+            const uint8_t* filter, size_t filter_len) {
+        return range_search_with_roaring_filter(query.data(), query.size(), params, filter, filter_len);
+    }
+
+    RangeSearchResult range_search_batch(
+            const float* queries, size_t queries_len, size_t query_count, RangeSearchParams params) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        validate_range_queries(queries, queries_len, query_count);
+        PaimonVindexRangeSearchResult* raw = nullptr;
+        int status = paimon_vindex_reader_range_search_batch(
+            require_open(), queries, queries_len, query_count, params.to_ffi(), &raw);
+        return detail::copy_range_result(raw, status);
+    }
+
+    RangeSearchResult range_search_batch(
+            const std::vector<float>& queries, size_t query_count, RangeSearchParams params) {
+        return range_search_batch(queries.data(), queries.size(), query_count, params);
+    }
+
+    RangeSearchResult range_search_batch_with_roaring_filter(
+            const float* queries, size_t queries_len, size_t query_count, RangeSearchParams params,
+            const uint8_t* filter, size_t filter_len) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        validate_range_queries(queries, queries_len, query_count);
+        PaimonVindexRangeSearchResult* raw = nullptr;
+        int status = paimon_vindex_reader_range_search_batch_with_roaring_filter(
+            require_open(), queries, queries_len, query_count, params.to_ffi(), filter, filter_len, &raw);
+        return detail::copy_range_result(raw, status);
+    }
+
+    RangeSearchResult range_search_batch_with_roaring_filter(
+            const std::vector<float>& queries, size_t query_count, RangeSearchParams params,
+            const uint8_t* filter, size_t filter_len) {
+        return range_search_batch_with_roaring_filter(
+            queries.data(), queries.size(), query_count, params, filter, filter_len);
+    }
+
     SearchResult search(const float* query, SearchParams params) {
         std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         SearchResult result;
@@ -669,6 +815,21 @@ public:
     }
 
 private:
+    void validate_range_queries(const float* queries, size_t queries_len, size_t query_count) const {
+        PaimonVindexMetadata metadata{};
+        check(paimon_vindex_reader_metadata(require_open(), &metadata));
+        if (metadata.dimension != 0 &&
+            query_count > std::numeric_limits<size_t>::max() / metadata.dimension) {
+            throw Error("range query dimensions overflow");
+        }
+        if (queries_len != query_count * metadata.dimension) {
+            throw Error("range query length does not match dimension and query count");
+        }
+        if (queries_len != 0 && !queries) {
+            throw Error("range queries must not be null for a nonempty input");
+        }
+    }
+
     PaimonVindexReaderHandle* require_open() const {
         if (!handle_) throw Error("vector index reader is closed");
         return handle_;

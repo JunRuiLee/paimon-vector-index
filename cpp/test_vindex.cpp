@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -41,6 +42,8 @@
         abort(); \
     } \
 } while (0)
+
+#include "../c/range_test_support.h"
 
 struct MemBuffer {
     std::vector<uint8_t> data;
@@ -233,6 +236,16 @@ static void run_roundtrip(
     ASSERT_EQ(batch.ids.size(), 2);
     assert_id_in_cluster(batch.ids[0], 0);
     assert_id_in_cluster(batch.ids[1], 1);
+    ASSERT_EQ(reader.supports_range_search(), expected_index_type != PAIMON_VINDEX_INDEX_TYPE_DISKANN);
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
+        bool rejected = false;
+        try {
+            reader.range_search(query, paimon::vindex::RangeSearchParams{});
+        } catch (const paimon::vindex::Error&) {
+            rejected = true;
+        }
+        ASSERT_TRUE(rejected);
+    }
     printf("PASS %s\n", name);
 }
 
@@ -339,9 +352,228 @@ static void test_extensible_search_params_forward_query_tuning() {
     printf("PASS extensible_search_params_forward_query_tuning\n");
 }
 
+template <typename Operation>
+static void assert_range_error(Operation operation) {
+    bool rejected = false;
+    try {
+        operation();
+    } catch (const paimon::vindex::Error& error) {
+        rejected = !std::string(error.what()).empty();
+    }
+    ASSERT_TRUE(rejected);
+}
+
+static PaimonVindexRangeSearchResultView range_view(
+        const paimon::vindex::RangeSearchResult& result) {
+    return {result.query_count, result.labels.size(), result.lims.data(),
+            result.labels.data(), result.distances.data(), result.stats.data(),
+            result.list_reads};
+}
+
+static paimon::vindex::RangeSearchParams range_cpp_params(
+        PaimonVindexRangeSearchParams raw) {
+    return {{raw.band.metric, raw.band.lower_kind, raw.band.lower,
+             raw.band.upper_kind, raw.band.upper}, raw.nprobe};
+}
+
+static void consume_range_fixture(const RangeFixture* fixture) {
+    MemBuffer buffer;
+    buffer.data.assign(fixture->index_data, fixture->index_data + fixture->index_len);
+    paimon::vindex::RangeSearchResult result;
+    {
+        paimon::vindex::Reader reader(make_input(buffer));
+        ASSERT_TRUE(reader.supports_range_search());
+        ASSERT_EQ(reader.metadata().dimension, fixture->dimension);
+        auto params = range_cpp_params(fixture->params);
+        const size_t query_len = fixture->dimension * fixture->query_count;
+        if (fixture->query_count == 1) {
+            result = fixture->filter_len == 0
+                ? reader.range_search(fixture->queries, query_len, params)
+                : reader.range_search_with_roaring_filter(
+                      fixture->queries, query_len, params, fixture->filter, fixture->filter_len);
+        } else {
+            result = fixture->filter_len == 0
+                ? reader.range_search_batch(fixture->queries, query_len, fixture->query_count, params)
+                : reader.range_search_batch_with_roaring_filter(
+                      fixture->queries, query_len, fixture->query_count, params,
+                      fixture->filter, fixture->filter_len);
+        }
+    }
+    auto view = range_view(result);
+    range_fixture_assert(fixture, &view);
+}
+
+static void test_range_endpoints() {
+    using namespace paimon::vindex;
+    for (uint32_t metric : {PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_METRIC_COSINE,
+                            PAIMON_VINDEX_METRIC_INNER_PRODUCT}) {
+        for (uint32_t lower_op : {PAIMON_VINDEX_CUT_GE, PAIMON_VINDEX_CUT_GT}) {
+            for (uint32_t upper_op : {PAIMON_VINDEX_CUT_LE, PAIMON_VINDEX_CUT_LT}) {
+                auto band = DistanceBand::from_endpoints(
+                    metric, DistanceEndpoint{0.5, lower_op}, DistanceEndpoint{1.0, upper_op});
+                for (float distance : {-1.0f, -0.5f, -0.0f, 0.0f, 0.25f,
+                                       std::nextafter(0.25f, 0.0f), 0.5f, 1.0f,
+                                       std::nextafter(1.0f, 2.0f), 4.0f}) {
+                    if (metric == PAIMON_VINDEX_METRIC_L2 && distance < 0) continue;
+                    double public_value = metric == PAIMON_VINDEX_METRIC_L2
+                        ? static_cast<double>(std::sqrt(distance))
+                        : metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT
+                            ? -static_cast<double>(distance) : static_cast<double>(distance);
+                    bool expected = (lower_op == PAIMON_VINDEX_CUT_GE
+                        ? public_value >= 0.5 : public_value > 0.5) &&
+                        (upper_op == PAIMON_VINDEX_CUT_LE ? public_value <= 1.0 : public_value < 1.0);
+                    ASSERT_EQ(expected,
+                        (band.lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || distance >= band.lower) &&
+                        (band.upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || distance < band.upper));
+                }
+            }
+        }
+        auto unbounded = DistanceBand::from_endpoints(metric);
+        ASSERT_EQ(unbounded.lower_kind, PAIMON_VINDEX_BOUND_UNBOUNDED);
+        ASSERT_EQ(unbounded.upper_kind, PAIMON_VINDEX_BOUND_UNBOUNDED);
+        auto precise = DistanceBand::from_endpoints(
+            metric, DistanceEndpoint{std::nextafter(1.0, 2.0), PAIMON_VINDEX_CUT_GE});
+        float boundary = metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT ? -1.0f : 1.0f;
+        ASSERT_TRUE(!((precise.lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || boundary >= precise.lower) &&
+                      (precise.upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || boundary < precise.upper)));
+    }
+    assert_range_error([] {
+        DistanceBand::from_endpoints(PAIMON_VINDEX_METRIC_L2,
+            DistanceEndpoint{1.0, PAIMON_VINDEX_CUT_LT});
+    });
+    assert_range_error([] {
+        DistanceBand::from_endpoints(PAIMON_VINDEX_METRIC_L2, std::nullopt,
+            DistanceEndpoint{std::numeric_limits<double>::infinity(), PAIMON_VINDEX_CUT_LE});
+    });
+    printf("PASS range_endpoints\n");
+}
+
+static void test_range_matrix() {
+    using namespace paimon::vindex;
+    const std::pair<const char*, uint32_t> metrics[] = {
+        {"l2", PAIMON_VINDEX_METRIC_L2}, {"cosine", PAIMON_VINDEX_METRIC_COSINE},
+        {"inner_product", PAIMON_VINDEX_METRIC_INNER_PRODUCT}};
+    std::vector<float> data(RANGE_VECTOR_COUNT * RANGE_DIMENSION);
+    std::vector<int64_t> labels(RANGE_VECTOR_COUNT);
+    std::vector<float> queries(RANGE_QUERY_COUNT * RANGE_DIMENSION);
+    range_fill_data(data.data(), labels.data(), queries.data());
+    const std::vector<float> query(queries.begin(), queries.begin() + RANGE_DIMENSION);
+    for (const char* index_type : {"ivf_flat", "ivf_sq", "ivf_pq", "ivf_rq"}) {
+        for (const auto& metric : metrics) {
+            Trainer trainer({{"index.type", index_type}, {"dimension", "8"},
+                             {"nlist", "4"}, {"metric", metric.first}});
+            Writer writer(trainer.add_training_vectors(data.data(), RANGE_VECTOR_COUNT).finish_training());
+            writer.add_vectors(labels.data(), data.data(), RANGE_VECTOR_COUNT);
+            MemBuffer buffer;
+            writer.write_index(make_output(buffer));
+            RangeSearchResult retained;
+            {
+                Reader reader(make_input(buffer));
+                ASSERT_TRUE(reader.supports_range_search());
+                auto params = range_cpp_params(range_all_params(metric.second));
+                auto batch = reader.range_search_batch(queries, RANGE_QUERY_COUNT, params);
+                auto batch_view = range_view(batch);
+                range_assert_shape(&batch_view);
+                ASSERT_EQ(batch.query_count, RANGE_QUERY_COUNT);
+                ASSERT_EQ(batch.labels.size(), RANGE_QUERY_COUNT * RANGE_VECTOR_COUNT);
+                ASSERT_TRUE(batch.list_reads > 0);
+                for (const auto& stats : batch.stats) {
+                    ASSERT_EQ(stats.lists_probed, RANGE_NLIST);
+                    ASSERT_EQ(stats.rows_scanned, RANGE_VECTOR_COUNT);
+                    ASSERT_EQ(stats.rows_committed, RANGE_VECTOR_COUNT);
+                    ASSERT_EQ(stats.early_abandoned, 0);
+                }
+                retained = reader.range_search(query, params);
+                ASSERT_EQ(retained.labels.size(), RANGE_VECTOR_COUNT);
+                auto topk = reader.search(query.data(), SearchParams{5, RANGE_NLIST});
+                ASSERT_EQ(topk.ids.size(), 5);
+                for (int64_t label : topk.ids) {
+                    ASSERT_TRUE(std::find(retained.labels.begin(), retained.labels.end(), label) != retained.labels.end());
+                }
+                auto filtered = reader.range_search_batch_with_roaring_filter(
+                    queries, RANGE_QUERY_COUNT, params, range_filter, sizeof(range_filter));
+                auto filtered_view = range_view(filtered);
+                range_assert_shape(&filtered_view);
+                ASSERT_EQ(filtered.labels.size(), RANGE_QUERY_COUNT * 2);
+                for (int64_t label : filtered.labels) {
+                    ASSERT_TRUE(label == labels[1] || label == labels[3]);
+                }
+                auto filtered_single = reader.range_search_with_roaring_filter(
+                    query, params, range_filter, sizeof(range_filter));
+                ASSERT_EQ(filtered_single.labels.size(), 2);
+                auto empty_filter = reader.range_search_with_roaring_filter(
+                    query, params, range_empty_filter, sizeof(range_empty_filter));
+                ASSERT_TRUE(empty_filter.labels.empty());
+                ASSERT_TRUE(empty_filter.lims == std::vector<size_t>({0, 0}));
+                auto bounded = params;
+                auto bounds = std::minmax_element(retained.distances.begin(), retained.distances.end());
+                bounded.band.lower_kind = PAIMON_VINDEX_BOUND_FINITE;
+                bounded.band.lower = metric.second == PAIMON_VINDEX_METRIC_L2
+                    ? std::max(0.0f, *bounds.first) : *bounds.first;
+                bounded.band.upper_kind = PAIMON_VINDEX_BOUND_FINITE;
+                bounded.band.upper = *bounds.first + (*bounds.second - *bounds.first) / 2.0f;
+                auto subset = reader.range_search_batch(queries, RANGE_QUERY_COUNT, bounded);
+                auto subset_view = range_view(subset);
+                range_assert_shape(&subset_view);
+                ASSERT_TRUE(subset.labels.size() > 0 && subset.labels.size() < batch.labels.size());
+                for (size_t query_index = 0; query_index < RANGE_QUERY_COUNT; ++query_index) {
+                    size_t expected = 0;
+                    for (size_t hit = batch.lims[query_index]; hit < batch.lims[query_index + 1]; ++hit) {
+                        if (batch.distances[hit] >= bounded.band.lower && batch.distances[hit] < bounded.band.upper) {
+                            ++expected;
+                            ASSERT_TRUE(std::find(subset.labels.begin() + subset.lims[query_index],
+                                subset.labels.begin() + subset.lims[query_index + 1], batch.labels[hit]) !=
+                                subset.labels.begin() + subset.lims[query_index + 1]);
+                        }
+                    }
+                    ASSERT_EQ(subset.lims[query_index + 1] - subset.lims[query_index], expected);
+                }
+                bounded.band.lower = bounded.band.upper;
+                auto empty = reader.range_search_batch(queries, RANGE_QUERY_COUNT, bounded);
+                ASSERT_TRUE(empty.labels.empty() && empty.distances.empty());
+                ASSERT_TRUE(empty.lims == std::vector<size_t>({0, 0, 0, 0}));
+                ASSERT_EQ(empty.list_reads, 0);
+                assert_range_error([&] { reader.range_search(nullptr, RANGE_DIMENSION, params); });
+                assert_range_error([&] { reader.range_search(std::vector<float>{}, params); });
+                assert_range_error([&] { reader.range_search_batch(queries, 2, params); });
+                assert_range_error([&] { reader.range_search_batch(nullptr, 0, 0, params); });
+                assert_range_error([&] {
+                    reader.range_search_batch(nullptr, 0, SIZE_MAX / RANGE_DIMENSION + 1, params);
+                });
+                assert_range_error([&] { reader.range_search_with_roaring_filter(query, params, nullptr, 1); });
+                assert_range_error([&] { reader.range_search_with_roaring_filter(query, params, range_filter, 1); });
+                auto invalid = params;
+                invalid.nprobe = 0;
+                assert_range_error([&] { reader.range_search(query, invalid); });
+                invalid = bounded;
+                invalid.nprobe = 0;
+                assert_range_error([&] { reader.range_search(query, invalid); });
+                invalid = params;
+                invalid.band.metric = (metric.second + 1) % 3;
+                assert_range_error([&] { reader.range_search(query, invalid); });
+                auto nan_query = query;
+                nan_query[0] = std::numeric_limits<float>::quiet_NaN();
+                assert_range_error([&] { reader.range_search(nan_query, params); });
+                Reader moved(std::move(reader));
+                assert_range_error([&] { reader.supports_range_search(); });
+                assert_range_error([&] { reader.range_search(query, params); });
+                ASSERT_TRUE(moved.supports_range_search());
+                ASSERT_EQ(moved.range_search(query, params).labels.size(), retained.labels.size());
+            }
+            auto retained_view = range_view(retained);
+            range_assert_shape(&retained_view);
+            ASSERT_EQ(retained.labels.size(), RANGE_VECTOR_COUNT);
+            printf("PASS range_matrix %s %s\n", index_type, metric.first);
+        }
+    }
+}
+
 int main() {
     test_supported_index_roundtrips();
     test_worker_callback_reentry_is_rejected();
     test_extensible_search_params_forward_query_tuning();
+    test_range_endpoints();
+    test_range_matrix();
+    range_fixture_run_all(consume_range_fixture);
     return 0;
 }

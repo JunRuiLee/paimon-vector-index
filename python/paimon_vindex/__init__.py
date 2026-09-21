@@ -20,7 +20,7 @@ import operator
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -126,6 +126,160 @@ class IvfPqBatchTableReuseMode(IntEnum):
     OFF = 0
     ON = 1
     AUTO = 2
+
+
+class DistanceEndpointOp(IntEnum):
+    GE = 0
+    GT = 1
+    LE = 2
+    LT = 3
+
+
+@dataclass(frozen=True)
+class DistanceEndpoint:
+    """A public-distance predicate literal, preserved as a double for core."""
+
+    value: float
+    op: DistanceEndpointOp
+
+    def __post_init__(self):
+        try:
+            endpoint_op = DistanceEndpointOp(self.op)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("distance endpoint operator is invalid") from exc
+        object.__setattr__(self, "value", float(self.value))
+        object.__setattr__(self, "op", endpoint_op)
+
+    def to_ffi(self):
+        return _ffi.PaimonVindexDistanceEndpoint(self.value, int(self.op))
+
+
+def _metric_code(metric):
+    for code, name in METRICS.items():
+        if metric == name:
+            return code
+    raise ValueError("metric must be l2, inner_product, or cosine")
+
+
+@dataclass(frozen=True)
+class DistanceBand:
+    """Half-open internal-distance band; None denotes an unbounded side.
+
+    Cuts use squared L2, negative inner product, or cosine distance. Core
+    validates the band during search. Use from_endpoints for public-distance
+    predicates instead of converting or rounding their literals in Python.
+    """
+
+    metric: str
+    lower: Optional[float] = None
+    upper: Optional[float] = None
+
+    def __post_init__(self):
+        _metric_code(self.metric)
+        for name in ("lower", "upper"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, float(value))
+
+    @classmethod
+    def from_endpoints(
+        cls,
+        metric: str,
+        lower: Optional[DistanceEndpoint] = None,
+        upper: Optional[DistanceEndpoint] = None,
+    ):
+        """Delegate GE/GT lower and LE/LT upper predicates to core.
+
+        Literals are public distances: sqrtf(squared L2), inner product,
+        or cosine distance. No float32 rounding precedes the native call.
+        """
+        _require_range_search()
+        metric_code = _metric_code(metric)
+        for endpoint in (lower, upper):
+            if endpoint is not None and not isinstance(endpoint, DistanceEndpoint):
+                raise TypeError("endpoints must be DistanceEndpoint or None")
+        raw_lower = lower.to_ffi() if lower is not None else None
+        raw_upper = upper.to_ffi() if upper is not None else None
+        band = _ffi.PaimonVindexDistanceBand()
+        rc = lib.paimon_vindex_distance_band_from_endpoints(
+            metric_code,
+            ctypes.byref(raw_lower) if raw_lower is not None else None,
+            ctypes.byref(raw_upper) if raw_upper is not None else None,
+            ctypes.byref(band),
+        )
+        if rc != 0:
+            _check_error("distance endpoint conversion failed")
+        return cls(
+            metric,
+            band.lower if band.lower_kind else None,
+            band.upper if band.upper_kind else None,
+        )
+
+    def to_ffi(self):
+        return _ffi.PaimonVindexDistanceBand(
+            _metric_code(self.metric),
+            int(self.lower is not None),
+            self.lower if self.lower is not None else 0.0,
+            int(self.upper is not None),
+            self.upper if self.upper is not None else 0.0,
+        )
+
+
+@dataclass(frozen=True)
+class RangeSearchParams:
+    band: DistanceBand
+    nprobe: int
+
+    def __post_init__(self):
+        if not isinstance(self.band, DistanceBand):
+            raise TypeError("band must be a DistanceBand")
+        object.__setattr__(
+            self, "nprobe", _size_t(self.nprobe, "nprobe", allow_zero=False)
+        )
+
+    def to_ffi(self):
+        return _ffi.PaimonVindexRangeSearchParams(self.band.to_ffi(), self.nprobe)
+
+
+@dataclass(frozen=True)
+class RangeSearchStats:
+    """Per-query logical counters copied from the native result."""
+
+    lists_probed: int
+    rows_scanned: int
+    rows_committed: int
+    early_abandoned: int
+
+
+@dataclass(frozen=True)
+class RangeSearchResult:
+    """Owned CSR arrays and per-query statistics, independent of the reader.
+
+    Distances retain the index's internal distance representation. list_reads
+    counts call-level list reads, not the sum of per-query lists_probed.
+    """
+
+    lims: np.ndarray
+    labels: np.ndarray
+    distances: np.ndarray
+    stats: Tuple[RangeSearchStats, ...]
+    list_reads: int
+
+    @property
+    def query_count(self):
+        return len(self.lims) - 1
+
+    @property
+    def hit_count(self):
+        return len(self.labels)
+
+    def query(self, index):
+        """Return label/distance slices for a nonnegative query index."""
+        index = operator.index(index)
+        if not 0 <= index < self.query_count:
+            raise IndexError("range query index out of bounds")
+        start, end = int(self.lims[index]), int(self.lims[index + 1])
+        return self.labels[start:end], self.distances[start:end]
 
 
 @dataclass(frozen=True)
@@ -282,6 +436,79 @@ def _float32_vector(value, name):
     if array.ndim != 1:
         raise ValueError(f"{name} must be a one-dimensional float32 array")
     return np.ascontiguousarray(array)
+
+
+def _require_range_search():
+    if not _ffi.RANGE_SEARCH_AVAILABLE:
+        raise RuntimeError(
+            "loaded native library does not support range search; "
+            "rebuild or upgrade the native library"
+        )
+
+
+def _range_buffer_length(length, itemsize, name):
+    length = _size_t(length, name, allow_zero=True)
+    if length > min(_SIZE_T_MAX, np.iinfo(np.intp).max) // itemsize:
+        raise ValueError(f"{name} is too large: buffer length overflow")
+    return length
+
+
+def _range_queries(value, dimension, batch):
+    array = np.asarray(value)
+    name = "queries" if batch else "query"
+    ndim = 2 if batch else 1
+    if array.ndim != ndim:
+        raise ValueError(f"{name} must be a {ndim}-dimensional float32 array")
+    if array.shape[-1] != dimension:
+        raise RuntimeError(
+            f"{name} dimension {array.shape[-1]} does not match "
+            f"index dimension {dimension}"
+        )
+    _range_buffer_length(array.size, ctypes.sizeof(ctypes.c_float), name)
+    return np.require(array, dtype=np.float32, requirements=["C", "A"])
+
+
+def _range_array_copy(pointer, length, dtype, name):
+    _range_buffer_length(length, np.dtype(dtype).itemsize, name)
+    if not length:
+        return np.empty(0, dtype=dtype)
+    if not pointer:
+        raise RuntimeError(f"range result {name} pointer is null")
+    return np.ctypeslib.as_array(pointer, shape=(length,)).copy()
+
+
+def _range_result_copy(handle, query_count):
+    view = _ffi.PaimonVindexRangeSearchResultView()
+    if lib.paimon_vindex_range_search_result_view(handle, ctypes.byref(view)) != 0:
+        _check_error("failed to view range result")
+    if view.query_count != query_count:
+        raise RuntimeError("range result query count does not match input")
+    _range_buffer_length(
+        query_count, ctypes.sizeof(_ffi.PaimonVindexRangeSearchStats), "stats"
+    )
+    lims = _range_array_copy(view.lims, query_count + 1, np.uintp, "lims")
+    if (
+        lims[0] != 0
+        or lims[-1] != view.hit_count
+        or np.any(lims[1:] < lims[:-1])
+    ):
+        raise RuntimeError("range result has invalid CSR limits")
+    labels = _range_array_copy(view.labels, view.hit_count, np.int64, "labels")
+    distances = _range_array_copy(
+        view.distances, view.hit_count, np.float32, "distances"
+    )
+    if query_count and not view.stats:
+        raise RuntimeError("range result stats pointer is null")
+    stats = tuple(
+        RangeSearchStats(
+            view.stats[index].lists_probed,
+            view.stats[index].rows_scanned,
+            view.stats[index].rows_committed,
+            view.stats[index].early_abandoned,
+        )
+        for index in range(query_count)
+    )
+    return RangeSearchResult(lims, labels, distances, stats, view.list_reads)
 
 
 def _int64_vector(value, name):
@@ -772,6 +999,79 @@ class VectorIndexReader:
             return None, 0, None
         return _bytes_buffer(filter_bytes, "filter_bytes")
 
+    def supports_range_search(self):
+        """Ask core whether this reader supports IVF distance range search."""
+        with self._native_handle_lock:
+            self._require_open()
+            if not _ffi.RANGE_SEARCH_AVAILABLE:
+                return False
+            supported = ctypes.c_int()
+            rc = lib.paimon_vindex_reader_supports_range_search(
+                self._handle, ctypes.byref(supported)
+            )
+            if rc != 0:
+                _check_error("range search capability check failed")
+            return bool(supported.value)
+
+    def range_search(self, query, params: RangeSearchParams, roaring_filter=None):
+        """Search one query, returning an owned one-query CSR result.
+
+        roaring_filter is optional serialized RoaringTreemap bytes. An empty
+        byte string is still a supplied filter and is validated by core.
+        """
+        return self._range_search(query, params, roaring_filter, batch=False)
+
+    def range_search_batch(
+        self, queries, params: RangeSearchParams, roaring_filter=None
+    ):
+        """Search a query matrix; core rejects a zero-query batch."""
+        return self._range_search(queries, params, roaring_filter, batch=True)
+
+    def _range_search(self, value, params, roaring_filter, *, batch):
+        _require_range_search()
+        if not isinstance(params, RangeSearchParams):
+            raise TypeError("params must be RangeSearchParams")
+        queries = _range_queries(value, self._metadata.dimension, batch)
+        query_count = queries.shape[0] if batch else 1
+        ffi_params = params.to_ffi()
+        with self._native_handle_lock:
+            self._require_open()
+            args = [
+                self._handle,
+                queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                queries.size,
+            ]
+            if batch:
+                args.append(query_count)
+            args.append(ffi_params)
+            if roaring_filter is None:
+                search = (
+                    lib.paimon_vindex_reader_range_search_batch
+                    if batch else lib.paimon_vindex_reader_range_search
+                )
+            else:
+                filter_buf, filter_len, _ = _bytes_buffer(
+                    roaring_filter, "roaring_filter"
+                )
+                _range_buffer_length(filter_len, 1, "roaring_filter")
+                args.extend((filter_buf, filter_len))
+                search = (
+                    lib.paimon_vindex_reader_range_search_batch_with_roaring_filter
+                    if batch
+                    else lib.paimon_vindex_reader_range_search_with_roaring_filter
+                )
+            handle = ctypes.c_void_p()
+            try:
+                rc = search(*args, ctypes.byref(handle))
+                if rc != 0:
+                    _check_error("range search failed")
+                if not handle:
+                    raise RuntimeError("range search returned a null result")
+                return _range_result_copy(handle, query_count)
+            finally:
+                if handle:
+                    lib.paimon_vindex_range_search_result_destroy(handle)
+
     def search(self, query, params: SearchParams, filter_bytes=None):
         query = _float32_vector(query, "query")
         if query.shape[0] != self._metadata.dimension:
@@ -875,7 +1175,13 @@ class VectorIndexReader:
 
 
 __all__ = [
+    "DistanceBand",
+    "DistanceEndpoint",
+    "DistanceEndpointOp",
     "IvfPqBatchTableReuseMode",
+    "RangeSearchParams",
+    "RangeSearchResult",
+    "RangeSearchStats",
     "SearchParams",
     "VectorIndexMetadata",
     "VectorIndexReadPlan",
