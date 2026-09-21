@@ -23,7 +23,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -123,26 +122,23 @@ public class VectorIndexRangeOracleTest {
                                     : reader.rangeSearchBatch(queries, queryCount, params, filter);
                 }
                 require(actual.queryCount() == queryCount, "query count");
-                require(Arrays.equals(lims, actual.lims()), "lims");
-                float[] actualDistances = actual.distances();
-                require(actualDistances.length == hitCount, "distance count");
-                int[] actualBits = new int[hitCount];
-                for (int offset = 0; offset < hitCount; offset++) {
-                    actualBits[offset] = Float.floatToRawIntBits(actualDistances[offset]);
-                }
-                long[] actualLabels = actual.labels();
+                require(actual.hitCount() == hitCount, "hit count");
                 for (int queryIndex = 0; queryIndex < queryCount; queryIndex++) {
                     int start = Math.toIntExact(lims[queryIndex]);
                     int end = Math.toIntExact(lims[queryIndex + 1]);
+                    require(actual.queryStart(queryIndex) == start, "query start");
+                    require(actual.queryEnd(queryIndex) == end, "query end");
                     require(
                             rows(labels, distances, start, end)
-                                    .equals(rows(actualLabels, actualBits, start, end)),
+                                    .equals(rows(actual, queryIndex)),
                             "label/distance-bit multiset for query " + queryIndex);
+                    require(stats[0][queryIndex] == actual.listsProbed(queryIndex), "listsProbed");
+                    require(stats[1][queryIndex] == actual.rowsScanned(queryIndex), "rowsScanned");
+                    require(stats[2][queryIndex] == actual.rowsCommitted(queryIndex), "rowsCommitted");
+                    require(
+                            stats[3][queryIndex] == actual.earlyAbandoned(queryIndex),
+                            "earlyAbandoned");
                 }
-                require(Arrays.equals(stats[0], actual.listsProbed()), "listsProbed");
-                require(Arrays.equals(stats[1], actual.rowsScanned()), "rowsScanned");
-                require(Arrays.equals(stats[2], actual.rowsCommitted()), "rowsCommitted");
-                require(Arrays.equals(stats[3], actual.earlyAbandoned()), "earlyAbandoned");
                 require(listReads == actual.listReads(), "listReads");
             }
         }
@@ -166,6 +162,20 @@ public class VectorIndexRangeOracleTest {
             Collections.sort(values);
         }
         return result;
+    }
+
+    private static Map<Long, List<Integer>> rows(VectorRangeSearchResult result, int queryIndex) {
+        Map<Long, List<Integer>> rows = new HashMap<Long, List<Integer>>();
+        for (int hitIndex = result.queryStart(queryIndex);
+                hitIndex < result.queryEnd(queryIndex);
+                hitIndex++) {
+            rows.computeIfAbsent(result.labelAt(hitIndex), label -> new ArrayList<Integer>())
+                    .add(Float.floatToRawIntBits(result.distanceAt(hitIndex)));
+        }
+        for (List<Integer> values : rows.values()) {
+            Collections.sort(values);
+        }
+        return rows;
     }
 
     private static int readBits(Scanner values) {

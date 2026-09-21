@@ -215,6 +215,8 @@ jobs:
 
       - name: Test JNI native behavior
         run: |
+          java -Xmx36m -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexRangeSearchTest \
+            --zero-copy-memory
           java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativeValidationTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
           java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativePanicBoundaryTest \

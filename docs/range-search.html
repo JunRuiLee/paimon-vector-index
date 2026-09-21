@@ -101,7 +101,7 @@ let high_similarity = DistanceBand::from_endpoints(
           <div class="table-wrap"><table><thead><tr><th>Binding</th><th>API and lifetime</th></tr></thead><tbody>
             <tr><td>C ABI / generated header</td><td><code>paimon_vindex_reader_range_search</code>, <code>_range_search_batch</code>, and both <code>_with_roaring_filter</code> variants return an owned opaque result through an output pointer. <code>paimon_vindex_range_search_result_view</code> borrows its buffers; <code>paimon_vindex_range_search_result_destroy</code> releases them. Query/filter lengths are explicit. The generated <code>include/paimon_vindex.h</code> is rebuilt by cbindgen, not maintained manually.</td></tr>
             <tr><td>C++</td><td><code>Reader::range_search</code>, <code>Reader::range_search_batch</code>, and their <code>_with_roaring_filter</code> variants copy CSR buffers into owning vectors. A native-result RAII guard handles cleanup, including allocation exceptions. Existing top-K methods remain unchanged.</td></tr>
-            <tr><td>JNI / Java</td><td><code>VectorIndexReader.rangeSearch</code> and <code>rangeSearchBatch</code> accept <code>VectorRangeSearchParams</code> and optional filter bytes. <code>VectorRangeSearchResult</code> owns defensively copied Java arrays. Native lengths are checked against JVM array limits; offsets, labels and counters use <code>long</code>.</td></tr>
+            <tr><td>JNI / Java</td><td><code>VectorIndexReader.rangeSearch</code> and <code>rangeSearchBatch</code> accept <code>VectorRangeSearchParams</code> and optional filter bytes. <code>VectorRangeSearchResult</code> takes ownership of JNI-created Java arrays. Its public constructor and array-returning accessors still make defensive copies. <code>hitCount()</code>, <code>labelAt(int)</code>, <code>distanceAt(int)</code>, <code>queryStart(int)</code>, <code>queryEnd(int)</code>, and per-query counter overloads provide allocation-free consumption. Native lengths are checked against JVM array limits; labels, stored offsets and counters use <code>long</code>, while Java hit indices and half-open query bounds use <code>int</code>.</td></tr>
             <tr><td>Python</td><td><code>VectorIndexReader.range_search</code> and <code>range_search_batch</code> accept <code>RangeSearchParams</code> and optional <code>roaring_filter=</code>. <code>RangeSearchResult</code> owns copied NumPy arrays (<code>uintp</code> offsets, <code>int64</code> labels, <code>float32</code> distances). Native results are freed in <code>finally</code>, even if conversion fails.</td></tr>
           </tbody></table></div>
           <p>Results remain valid after the reader closes. In C, destroy each successful result exactly once, never free its individual arrays, and never access a view after destruction. Input queries and filter bytes are borrowed only for the call. Search sets a valid output pointer to <code>NULL</code> before doing work; an error returns <code>-1</code>, sets <code>paimon_vindex_last_error()</code>, and transfers no result. <code>destroy(NULL)</code> is safe. Callers must supply valid, aligned buffers and live handles; C callers must synchronize operations on a reader. C++, Java and Python retain their existing callback-aware handle locks.</p>
@@ -137,8 +137,17 @@ auto first_end = result.lims[1];</code></pre></div>
 VectorRangeSearchParams params = new VectorRangeSearchParams(band, 8);
 VectorRangeSearchResult result = reader.rangeSearchBatch(
         queries, queryCount, params, roaringFilter);
-long[] labels = result.labelsForQuery(0);
+for (int queryIndex = 0; queryIndex &lt; result.queryCount(); queryIndex++) {
+    for (int hitIndex = result.queryStart(queryIndex);
+            hitIndex &lt; result.queryEnd(queryIndex); hitIndex++) {
+        long label = result.labelAt(hitIndex);
+        float distance = result.distanceAt(hitIndex);
+        consume(label, distance);
+    }
+    long rowsScanned = result.rowsScanned(queryIndex);
+}
 long listReads = result.listReads();</code></pre></div>
+          <p>Range results are uncapped and still require storage proportional to the number of hits and queries. In Java, prefer indexed access for large results: the array-returning and per-query slice methods intentionally allocate copies. C views borrow result-owned storage, C++ vectors are directly accessible, and Python query slices share the result's owned NumPy arrays. Zero-copy consumption avoids another payload allocation; it is not streaming search or a bound on native search memory.</p>
           <div class="code-block"><span class="code-label">Python · shared filtered batch</span><pre><code>from paimon_vindex import DistanceBand, DistanceEndpoint, DistanceEndpointOp, RangeSearchParams
 
 band = DistanceBand.from_endpoints(

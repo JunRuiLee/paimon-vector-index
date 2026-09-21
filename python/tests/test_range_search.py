@@ -338,6 +338,45 @@ def test_empty_batch_and_query_accessor(vindex, flat_index):
         result.query(0.5)
 
 
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("filter_kind", ["none", "subset", "empty"])
+def test_query_access_shares_owned_payload(vindex, flat_index, batch, filter_kind):
+    payload, data, labels = flat_index
+    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    filter_bytes = {
+        "none": None,
+        "subset": roaring_allowlist(labels[::3]),
+        "empty": roaring_allowlist(labels[:0]),
+    }[filter_kind]
+    with vindex.VectorIndexReader(BytesInput(payload)) as reader:
+        method = reader.range_search_batch if batch else reader.range_search
+        result = method(
+            data[:3] if batch else data[0], params, roaring_filter=filter_bytes
+        )
+    retained_views = []
+    for query_index in range(result.query_count):
+        start, end = int(result.lims[query_index]), int(result.lims[query_index + 1])
+        for owned, view, repeated in zip(
+            (result.labels, result.distances),
+            result.query(query_index),
+            result.query(query_index),
+        ):
+            assert view.base is owned and repeated.base is owned
+            assert view.flags.writeable and repeated.flags.writeable
+            np.testing.assert_array_equal(view, owned[start:end])
+            if len(view):
+                assert np.shares_memory(view, repeated)
+                view[0] = -1
+                assert owned[start] == repeated[0] == -1
+                owned[end - 1] = -2
+                assert view[-1] == repeated[-1] == -2
+            retained_views.append(view)
+    del result, owned, view, repeated
+    for view in retained_views:
+        if len(view):
+            assert view[-1] == -2
+
+
 @pytest.mark.parametrize("batch,shape,error", [
     (False, (), ValueError), (False, (1, 16), ValueError),
     (False, (15,), RuntimeError), (False, (0,), RuntimeError),
@@ -413,18 +452,33 @@ def test_diskann_is_unsupported(vindex):
                 method(query, params)
 
 
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("filtered", [False, True])
 @pytest.mark.parametrize("failure", [
-    "view", "copy", "stats", "search", "null", "null_distances",
+    "view", "copy_lims", "copy_labels", "copy_distances", "stats", "result",
+    "search", "null", "null_distances",
     "null_stats", "null_lims", "length", "overflow", "lims",
 ])
-def test_result_destroyed_on_failure(vindex, flat_index, monkeypatch, failure):
-    payload, data, _ = flat_index
+def test_result_destroyed_on_failure(
+    vindex, flat_index, monkeypatch, failure, batch, filtered
+):
+    payload, data, labels = flat_index
     params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
     ffi = vindex._ffi
     destroyed = []
     destroy = ffi.lib.paimon_vindex_range_search_result_destroy
     view_result = ffi.lib.paimon_vindex_range_search_result_view
-    search = ffi.lib.paimon_vindex_reader_range_search
+    search_name = "paimon_vindex_reader_range_search"
+    if batch:
+        search_name += "_batch"
+    if filtered:
+        search_name += "_with_roaring_filter"
+    search = getattr(ffi.lib, search_name)
+    as_array = np.ctypeslib.as_array
+    array_count = 0
+    copy_failure_at = {"copy_lims": 1, "copy_labels": 2, "copy_distances": 3}.get(
+        failure
+    )
 
     def track_destroy(handle):
         destroyed.append(handle.value)
@@ -446,7 +500,7 @@ def test_result_destroyed_on_failure(vindex, flat_index, monkeypatch, failure):
         if failure == "null_lims":
             raw.lims = ctypes.POINTER(ctypes.c_size_t)()
         if failure == "length":
-            raw.query_count = 2
+            raw.query_count += 1
         if failure == "overflow":
             raw.hit_count = ctypes.c_size_t(-1).value
             raw.lims[raw.query_count] = raw.hit_count
@@ -461,20 +515,34 @@ def test_result_destroyed_on_failure(vindex, flat_index, monkeypatch, failure):
     def fail_copy(*args, **kwargs):
         raise MemoryError("copy failed")
 
+    def fail_array(*args, **kwargs):
+        nonlocal array_count
+        array_count += 1
+        if array_count == copy_failure_at:
+            raise MemoryError("copy failed")
+        return as_array(*args, **kwargs)
+
     monkeypatch.setattr(
         ffi.lib, "paimon_vindex_range_search_result_destroy", track_destroy
     )
     monkeypatch.setattr(ffi.lib, "paimon_vindex_range_search_result_view", alter_view)
     if failure == "search":
-        monkeypatch.setattr(ffi.lib, "paimon_vindex_reader_range_search", failed_search)
-    if failure == "copy":
-        monkeypatch.setattr(np.ctypeslib, "as_array", fail_copy)
+        monkeypatch.setattr(ffi.lib, search_name, failed_search)
+    if copy_failure_at is not None:
+        monkeypatch.setattr(np.ctypeslib, "as_array", fail_array)
     if failure == "stats":
         monkeypatch.setattr(vindex, "RangeSearchStats", fail_copy)
+    if failure == "result":
+        monkeypatch.setattr(vindex, "RangeSearchResult", fail_copy)
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
+        method = reader.range_search_batch if batch else reader.range_search
         with pytest.raises((MemoryError, RuntimeError, ValueError)):
-            reader.range_search(data[0], params)
+            method(
+                data[:2] if batch else data[0], params,
+                roaring_filter=roaring_allowlist(labels[::3]) if filtered else None,
+            )
         assert len(destroyed) == 1 and destroyed[0]
+        assert reader.supports_range_search()
 
 
 def test_result_copies_survive_native_destruction(vindex, flat_index, monkeypatch):

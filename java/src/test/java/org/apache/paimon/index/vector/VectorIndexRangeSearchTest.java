@@ -35,6 +35,11 @@ public class VectorIndexRangeSearchTest {
     private static final int VECTOR_COUNT = 256;
 
     public static void main(String[] args) {
+        if (args.length == 1 && "--zero-copy-memory".equals(args[0])) {
+            testMemoryBoundedConsumption();
+            System.out.println("Range result consumption passed with a bounded heap");
+            return;
+        }
         VectorIndexNativeLoaderSmokeTest.configureExternalLibrary(args);
         testValueTypes();
         testNative();
@@ -44,6 +49,7 @@ public class VectorIndexRangeSearchTest {
 
     static void testValueTypes() {
         testNativeResultOwnership();
+        testIndexedResultAccess();
         VectorDistanceBand band = new VectorDistanceBand("l2", null, 4.0f);
         check(band.lower() == null && band.upper() == 4.0f, "structural bounds");
         check("l2".equals(band.metric()), "metric");
@@ -142,6 +148,125 @@ public class VectorIndexRangeSearchTest {
         expect(NullPointerException.class, () -> closed.rangeSearch(new float[1], params, null));
     }
 
+    private static void testIndexedResultAccess() {
+        long[] labels = {Long.MIN_VALUE, LABEL_BASE, Long.MAX_VALUE};
+        float[] distances = {-0.0f, 1.5f, Float.POSITIVE_INFINITY};
+        long[] lims = {0, 0, 2, 2, 3};
+        long[] listsProbed = {0, 4, 0, 2};
+        long[] rowsScanned = {0, Long.MAX_VALUE, 0, 3};
+        long[] rowsCommitted = {0, 2, 0, 1};
+        long[] earlyAbandoned = {0, 1, 0, 2};
+        VectorRangeSearchResult[] results = {
+            new VectorRangeSearchResult(
+                    labels, distances, lims, listsProbed, rowsScanned,
+                    rowsCommitted, earlyAbandoned, 3),
+            VectorRangeSearchResult.fromNative(
+                    labels, distances, lims, listsProbed, rowsScanned,
+                    rowsCommitted, earlyAbandoned, 3)
+        };
+        for (VectorRangeSearchResult result : results) {
+            check(result.hitCount() == labels.length, "indexed hit count");
+            for (int queryIndex = 0; queryIndex < result.queryCount(); queryIndex++) {
+                check(result.queryStart(queryIndex) == lims[queryIndex], "query start");
+                check(result.queryEnd(queryIndex) == lims[queryIndex + 1], "query end");
+                check(result.listsProbed(queryIndex) == listsProbed[queryIndex], "indexed listsProbed");
+                check(result.rowsScanned(queryIndex) == rowsScanned[queryIndex], "indexed rowsScanned");
+                check(
+                        result.rowsCommitted(queryIndex) == rowsCommitted[queryIndex],
+                        "indexed rowsCommitted");
+                check(
+                        result.earlyAbandoned(queryIndex) == earlyAbandoned[queryIndex],
+                        "indexed earlyAbandoned");
+                for (int hitIndex = result.queryStart(queryIndex);
+                        hitIndex < result.queryEnd(queryIndex);
+                        hitIndex++) {
+                    check(result.labelAt(hitIndex) == labels[hitIndex], "indexed label");
+                    check(
+                            Float.floatToRawIntBits(result.distanceAt(hitIndex))
+                                    == Float.floatToRawIntBits(distances[hitIndex]),
+                            "indexed distance bits");
+                }
+            }
+            result.labels()[0] = 0;
+            result.distances()[0] = 1;
+            result.lims()[1] = 1;
+            result.listsProbed()[1] = 0;
+            result.rowsScanned()[1] = 0;
+            result.rowsCommitted()[1] = 0;
+            result.earlyAbandoned()[1] = 0;
+            check(result.labelAt(0) == Long.MIN_VALUE, "indexed labels remain immutable");
+            check(Float.floatToRawIntBits(result.distanceAt(0)) == 0x80000000, "signed zero retained");
+            check(result.queryEnd(0) == 0, "indexed offsets remain immutable");
+            check(
+                    result.listsProbed(1) == 4 && result.rowsScanned(1) == Long.MAX_VALUE,
+                    "indexed stats remain immutable");
+            check(
+                    result.rowsCommitted(1) == 2 && result.earlyAbandoned(1) == 1,
+                    "indexed counters remain immutable");
+            for (int hitIndex : new int[] {-1, result.hitCount(), Integer.MAX_VALUE}) {
+                expect(IndexOutOfBoundsException.class, () -> result.labelAt(hitIndex));
+                expect(IndexOutOfBoundsException.class, () -> result.distanceAt(hitIndex));
+            }
+            for (int queryIndex : new int[] {-1, result.queryCount(), Integer.MAX_VALUE}) {
+                checkInvalidQueryIndex(result, queryIndex);
+            }
+        }
+        for (long[] emptyLims : new long[][] {{0}, {0, 0, 0}}) {
+            long[] counters = new long[emptyLims.length - 1];
+            VectorRangeSearchResult empty =
+                    VectorRangeSearchResult.fromNative(
+                            new long[0], new float[0], emptyLims,
+                            counters, counters, counters, counters, 0);
+            check(empty.hitCount() == 0, "empty indexed result");
+            for (int queryIndex = 0; queryIndex < empty.queryCount(); queryIndex++) {
+                check(
+                        empty.queryStart(queryIndex) == 0 && empty.queryEnd(queryIndex) == 0,
+                        "empty query bounds");
+            }
+            expect(IndexOutOfBoundsException.class, () -> empty.labelAt(0));
+            expect(IndexOutOfBoundsException.class, () -> empty.distanceAt(0));
+            checkInvalidQueryIndex(empty, empty.queryCount());
+        }
+    }
+
+    private static void checkInvalidQueryIndex(VectorRangeSearchResult result, int queryIndex) {
+        expect(IndexOutOfBoundsException.class, () -> result.queryStart(queryIndex));
+        expect(IndexOutOfBoundsException.class, () -> result.queryEnd(queryIndex));
+        expect(IndexOutOfBoundsException.class, () -> result.listsProbed(queryIndex));
+        expect(IndexOutOfBoundsException.class, () -> result.rowsScanned(queryIndex));
+        expect(IndexOutOfBoundsException.class, () -> result.rowsCommitted(queryIndex));
+        expect(IndexOutOfBoundsException.class, () -> result.earlyAbandoned(queryIndex));
+    }
+
+    private static void testMemoryBoundedConsumption() {
+        check(Runtime.getRuntime().maxMemory() <= 40L * 1024 * 1024, "run with -Xmx36m");
+        int hitCount = 2_000_000;
+        long[] labels = new long[hitCount];
+        float[] distances = new float[hitCount];
+        labels[0] = LABEL_BASE;
+        labels[hitCount - 1] = LABEL_BASE + 1;
+        distances[0] = 1.25f;
+        distances[hitCount - 1] = -3.5f;
+        VectorRangeSearchResult result =
+                VectorRangeSearchResult.fromNative(
+                        labels, distances, new long[] {0, 0, hitCount},
+                        new long[] {0, 1}, new long[] {0, hitCount},
+                        new long[] {0, hitCount}, new long[2], 1);
+        check(result.hitCount() == hitCount && result.queryCount() == 2, "large result shape");
+        check(result.queryStart(0) == result.queryEnd(0), "large result empty query");
+        long labelSum = 0;
+        double distanceSum = 0;
+        for (int hitIndex = result.queryStart(1); hitIndex < result.queryEnd(1); hitIndex++) {
+            labelSum += result.labelAt(hitIndex);
+            distanceSum += result.distanceAt(hitIndex);
+        }
+        check(labelSum == 2 * LABEL_BASE + 1 && distanceSum == -2.25, "large result consumption");
+        check(result.listsProbed(1) == 1 && result.rowsScanned(1) == hitCount, "large result stats");
+        check(
+                result.rowsCommitted(1) == hitCount && result.earlyAbandoned(1) == 0,
+                "large result counters");
+    }
+
     private static void testNativeResultOwnership() {
         long[] labels = {LABEL_BASE, 7};
         float[] distances = {1, 3};
@@ -237,9 +362,71 @@ public class VectorIndexRangeSearchTest {
         }
         testExactDistancesAndEndpoints();
         testNativeValidation();
+        testBatchMetadataTransfer();
         testCallbacks();
         testUnsupported();
         VectorIndexRangeOracleTest.runIfConfigured();
+    }
+
+    private static void testBatchMetadataTransfer() {
+        float[] data = new float[16];
+        Arrays.fill(data, 8, 16, 1.0f);
+        VectorRangeSearchParams params = params("l2", null, 0.5f);
+        VectorRangeSearchResult[] singles = new VectorRangeSearchResult[3];
+        int[] queryCounts = {1023, 1024, 1025, 2048, 2051};
+        VectorRangeSearchResult[] batches = new VectorRangeSearchResult[queryCounts.length];
+        try (VectorIndexReader reader = open(build("ivf_flat", "l2", 8, data))) {
+            for (int queryKind = 0; queryKind < singles.length; queryKind++) {
+                float[] query = new float[8];
+                Arrays.fill(query, queryKind == 2 ? 3.0f : queryKind);
+                singles[queryKind] = reader.rangeSearch(query, params);
+                check(
+                        singles[queryKind].hitCount() == (queryKind == 2 ? 0 : 1),
+                        "metadata reference hits");
+            }
+            for (int batchIndex = 0; batchIndex < queryCounts.length; batchIndex++) {
+                int queryCount = queryCounts[batchIndex];
+                float[] queries = new float[queryCount * 8];
+                for (int queryIndex = 0; queryIndex < queryCount; queryIndex++) {
+                    int queryKind = queryIndex % singles.length;
+                    Arrays.fill(
+                            queries, queryIndex * 8, (queryIndex + 1) * 8,
+                            queryKind == 2 ? 3.0f : queryKind);
+                }
+                batches[batchIndex] = reader.rangeSearchBatch(queries, queryCount, params);
+            }
+        }
+        for (int batchIndex = 0; batchIndex < queryCounts.length; batchIndex++) {
+            VectorRangeSearchResult batch = batches[batchIndex];
+            check(batch.queryCount() == queryCounts[batchIndex], "metadata query count");
+            int expectedStart = 0;
+            for (int queryIndex = 0; queryIndex < batch.queryCount(); queryIndex++) {
+                VectorRangeSearchResult single = singles[queryIndex % singles.length];
+                check(batch.queryStart(queryIndex) == expectedStart, "metadata query start");
+                check(
+                        batch.queryEnd(queryIndex) == expectedStart + single.hitCount(),
+                        "metadata query end");
+                check(batch.listsProbed(queryIndex) == single.listsProbed(0), "metadata listsProbed");
+                check(batch.rowsScanned(queryIndex) == single.rowsScanned(0), "metadata rowsScanned");
+                check(
+                        batch.rowsCommitted(queryIndex) == single.rowsCommitted(0),
+                        "metadata rowsCommitted");
+                check(
+                        batch.earlyAbandoned(queryIndex) == single.earlyAbandoned(0),
+                        "metadata earlyAbandoned");
+                for (int hitIndex = 0; hitIndex < single.hitCount(); hitIndex++) {
+                    check(
+                            batch.labelAt(expectedStart + hitIndex) == single.labelAt(hitIndex),
+                            "retained batch label");
+                    check(
+                            Float.floatToRawIntBits(batch.distanceAt(expectedStart + hitIndex))
+                                    == Float.floatToRawIntBits(single.distanceAt(hitIndex)),
+                            "retained batch distance bits");
+                }
+                expectedStart += single.hitCount();
+            }
+            check(batch.hitCount() == expectedStart, "metadata total hits");
+        }
     }
 
     private static void testIndex(String indexType, String metric) {

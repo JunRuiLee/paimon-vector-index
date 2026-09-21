@@ -23,8 +23,15 @@ import java.util.Objects;
 /**
  * CSR range-search output in core scan order, with raw distances and no sorting or top-K cap.
  * IVF-Flat distances are exact; SQ, PQ and RQ return their core distance estimates. Each query
- * occupies [lims[query], lims[query + 1]). Public construction and array access make defensive
- * copies; native construction takes exclusive ownership of its arrays.
+ * occupies [lims[query], lims[query + 1]). Public construction and array-returning accessors make
+ * defensive copies; native construction takes exclusive ownership of its arrays.
+ *
+ * <p>For allocation-free consumption, use {@link #hitCount()}, {@link #labelAt(int)},
+ * {@link #distanceAt(int)}, and the half-open bounds {@link #queryStart(int)} and
+ * {@link #queryEnd(int)}. Counter accessors taking a query index also avoid copying arrays.
+ * Hit indices and query bounds fit in {@code int}, while labels and counters retain their full
+ * {@code long} range. Indexed accessors reject out-of-range indices with
+ * {@link IndexOutOfBoundsException}.
  */
 public final class VectorRangeSearchResult {
 
@@ -121,12 +128,34 @@ public final class VectorRangeSearchResult {
         return lims.length - 1;
     }
 
+    public int hitCount() {
+        return labels.length;
+    }
+
+    public int queryStart(int queryIndex) {
+        checkQueryIndex(queryIndex);
+        return Math.toIntExact(lims[queryIndex]);
+    }
+
+    public int queryEnd(int queryIndex) {
+        checkQueryIndex(queryIndex);
+        return Math.toIntExact(lims[queryIndex + 1]);
+    }
+
     public long[] labels() {
         return labels.clone();
     }
 
+    public long labelAt(int hitIndex) {
+        return labels[hitIndex];
+    }
+
     public float[] distances() {
         return distances.clone();
+    }
+
+    public float distanceAt(int hitIndex) {
+        return distances[hitIndex];
     }
 
     public long[] lims() {
@@ -138,18 +167,38 @@ public final class VectorRangeSearchResult {
         return listsProbed.clone();
     }
 
+    public long listsProbed(int queryIndex) {
+        checkQueryIndex(queryIndex);
+        return listsProbed[queryIndex];
+    }
+
     /** Allow-listed rows evaluated per query, including early-abandoned rows. */
     public long[] rowsScanned() {
         return rowsScanned.clone();
+    }
+
+    public long rowsScanned(int queryIndex) {
+        checkQueryIndex(queryIndex);
+        return rowsScanned[queryIndex];
     }
 
     public long[] rowsCommitted() {
         return rowsCommitted.clone();
     }
 
+    public long rowsCommitted(int queryIndex) {
+        checkQueryIndex(queryIndex);
+        return rowsCommitted[queryIndex];
+    }
+
     /** Core diagnostic count, not an arithmetic work measure. */
     public long[] earlyAbandoned() {
         return earlyAbandoned.clone();
+    }
+
+    public long earlyAbandoned(int queryIndex) {
+        checkQueryIndex(queryIndex);
+        return earlyAbandoned[queryIndex];
     }
 
     /** Non-empty unique list reads for the whole call; SQ cache hits do not count. */

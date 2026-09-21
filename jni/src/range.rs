@@ -173,28 +173,38 @@ fn long_array<'local>(
     Ok(array)
 }
 
+fn counter_array<'local>(
+    env: &mut JNIEnv<'local>,
+    len: usize,
+    name: &str,
+    value_at: impl Fn(usize) -> usize,
+) -> Result<AutoLocal<'local, JLongArray<'local>>, String> {
+    let array = env
+        .new_long_array(checked_array_length(len, name)?)
+        .map_err(|error| error.to_string())?;
+    let array = env.auto_local(array);
+    let mut scratch = [0; 1024];
+    for offset in (0..len).step_by(scratch.len()) {
+        let count = (len - offset).min(scratch.len());
+        for (index, value) in scratch[..count].iter_mut().enumerate() {
+            *value = checked_counter(value_at(offset + index), name)?;
+        }
+        env.set_long_array_region(
+            &array,
+            checked_array_length(offset, name)?,
+            &scratch[..count],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(array)
+}
+
 fn build_range_result(env: &mut JNIEnv, result: RangeSearchResult) -> Result<jobject, String> {
     checked_array_length(result.query_count(), "query count")?;
     checked_array_length(result.lims().len(), "lims")?;
     checked_array_length(result.labels().len(), "labels")?;
     let distance_count = checked_array_length(result.distances().len(), "distances")?;
     let list_reads = checked_counter(result.call_stats().list_reads(), "listReads")?;
-    let lims = result
-        .lims()
-        .iter()
-        .map(|&value| checked_counter(value, "lims"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut lists_probed = Vec::with_capacity(result.query_count());
-    let mut rows_scanned = Vec::with_capacity(result.query_count());
-    let mut rows_committed = Vec::with_capacity(result.query_count());
-    let mut early_abandoned = Vec::with_capacity(result.query_count());
-    for query_index in 0..result.query_count() {
-        let stats = result.query(query_index).stats;
-        lists_probed.push(checked_counter(stats.lists_probed(), "listsProbed")?);
-        rows_scanned.push(checked_counter(stats.rows_scanned(), "rowsScanned")?);
-        rows_committed.push(checked_counter(stats.rows_committed(), "rowsCommitted")?);
-        early_abandoned.push(checked_counter(stats.early_abandoned(), "earlyAbandoned")?);
-    }
     let labels = long_array(env, result.labels(), "labels")?;
     let distances = env
         .new_float_array(distance_count)
@@ -202,11 +212,21 @@ fn build_range_result(env: &mut JNIEnv, result: RangeSearchResult) -> Result<job
     let distances = env.auto_local(distances);
     env.set_float_array_region(&distances, 0, result.distances())
         .map_err(|error| error.to_string())?;
-    let lims = long_array(env, &lims, "lims")?;
-    let lists_probed = long_array(env, &lists_probed, "listsProbed")?;
-    let rows_scanned = long_array(env, &rows_scanned, "rowsScanned")?;
-    let rows_committed = long_array(env, &rows_committed, "rowsCommitted")?;
-    let early_abandoned = long_array(env, &early_abandoned, "earlyAbandoned")?;
+    let lims = counter_array(env, result.lims().len(), "lims", |index| {
+        result.lims()[index]
+    })?;
+    let lists_probed = counter_array(env, result.query_count(), "listsProbed", |index| {
+        result.query(index).stats.lists_probed()
+    })?;
+    let rows_scanned = counter_array(env, result.query_count(), "rowsScanned", |index| {
+        result.query(index).stats.rows_scanned()
+    })?;
+    let rows_committed = counter_array(env, result.query_count(), "rowsCommitted", |index| {
+        result.query(index).stats.rows_committed()
+    })?;
+    let early_abandoned = counter_array(env, result.query_count(), "earlyAbandoned", |index| {
+        result.query(index).stats.early_abandoned()
+    })?;
     env.call_static_method(
         "org/apache/paimon/index/vector/VectorRangeSearchResult",
         "fromNative",
