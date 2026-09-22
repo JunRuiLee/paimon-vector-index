@@ -20,7 +20,7 @@ import operator
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Mapping, Optional, Tuple
+from typing import Mapping, NamedTuple, Optional, Tuple
 
 import numpy as np
 
@@ -161,25 +161,47 @@ def _metric_code(metric):
     raise ValueError("metric must be l2, inner_product, or cosine")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class DistanceBand:
-    """Half-open internal-distance band; None denotes an unbounded side.
+    """Use from_endpoints for public predicates, from_raw for raw cuts.
 
-    Cuts use squared L2, negative inner product, or cosine distance. Core
-    validates the band during search. Use from_endpoints for public-distance
-    predicates instead of converting or rounding their literals in Python.
+    Raw cuts use squared L2, negative inner product, or cosine distance in a
+    half-open [raw_lower, raw_upper) band. None denotes an unbounded side.
+    Core validates raw bands during search.
     """
 
     metric: str
-    lower: Optional[float] = None
-    upper: Optional[float] = None
+    raw_lower: Optional[float] = None
+    raw_upper: Optional[float] = None
 
-    def __post_init__(self):
-        _metric_code(self.metric)
-        for name in ("lower", "upper"):
-            value = getattr(self, name)
-            if value is not None:
-                object.__setattr__(self, name, float(value))
+    def __init__(self, *args, **kwargs):
+        raise TypeError(
+            "Use DistanceBand.from_endpoints() for public-distance predicates "
+            "or DistanceBand.from_raw() for explicit raw-distance cuts"
+        )
+
+    @classmethod
+    def from_raw(
+        cls,
+        metric: str,
+        raw_lower: Optional[float] = None,
+        raw_upper: Optional[float] = None,
+    ):
+        """Construct raw [raw_lower, raw_upper) cuts without metric conversion.
+
+        None is unbounded. Finite, ordered, metric-compatible cuts are
+        validated by core during search, not by this factory.
+        """
+        _metric_code(metric)
+        band = object.__new__(cls)
+        object.__setattr__(band, "metric", metric)
+        object.__setattr__(
+            band, "raw_lower", float(raw_lower) if raw_lower is not None else None
+        )
+        object.__setattr__(
+            band, "raw_upper", float(raw_upper) if raw_upper is not None else None
+        )
+        return band
 
     @classmethod
     def from_endpoints(
@@ -200,7 +222,7 @@ class DistanceBand:
                 raise TypeError("endpoints must be DistanceEndpoint or None")
         raw_lower = lower.to_ffi() if lower is not None else None
         raw_upper = upper.to_ffi() if upper is not None else None
-        band = _ffi.PaimonVindexDistanceBand()
+        band = _ffi.PaimonVindexRawDistanceBand()
         rc = lib.paimon_vindex_distance_band_from_endpoints(
             metric_code,
             ctypes.byref(raw_lower) if raw_lower is not None else None,
@@ -209,19 +231,19 @@ class DistanceBand:
         )
         if rc != 0:
             _check_error("distance endpoint conversion failed")
-        return cls(
+        return cls.from_raw(
             metric,
-            band.lower if band.lower_kind else None,
-            band.upper if band.upper_kind else None,
+            band.raw_lower if band.raw_lower_kind else None,
+            band.raw_upper if band.raw_upper_kind else None,
         )
 
     def to_ffi(self):
-        return _ffi.PaimonVindexDistanceBand(
+        return _ffi.PaimonVindexRawDistanceBand(
             _metric_code(self.metric),
-            int(self.lower is not None),
-            self.lower if self.lower is not None else 0.0,
-            int(self.upper is not None),
-            self.upper if self.upper is not None else 0.0,
+            int(self.raw_lower is not None),
+            self.raw_lower if self.raw_lower is not None else 0.0,
+            int(self.raw_upper is not None),
+            self.raw_upper if self.raw_upper is not None else 0.0,
         )
 
 
@@ -251,17 +273,25 @@ class RangeSearchStats:
     early_abandoned: int
 
 
+class RangeSearchQueryResult(NamedTuple):
+    """Unpackable label/raw-distance views sharing the owned result arrays."""
+
+    labels: np.ndarray
+    raw_distances: np.ndarray
+
+
 @dataclass(frozen=True)
 class RangeSearchResult:
     """Owned CSR arrays and per-query statistics, independent of the reader.
 
-    Distances retain the index's internal distance representation. list_reads
-    counts call-level list reads, not the sum of per-query lists_probed.
+    raw_distances are squared L2, negative inner product, or cosine distance,
+    not converted public distances. list_reads counts call-level list reads,
+    not the sum of per-query lists_probed.
     """
 
     lims: np.ndarray
     labels: np.ndarray
-    distances: np.ndarray
+    raw_distances: np.ndarray
     stats: Tuple[RangeSearchStats, ...]
     list_reads: int
 
@@ -273,13 +303,19 @@ class RangeSearchResult:
     def hit_count(self):
         return len(self.labels)
 
-    def query(self, index):
-        """Return label/distance slices for a nonnegative query index."""
+    def query(self, index) -> RangeSearchQueryResult:
+        """Return unpackable labels/raw_distances views, without payload copies.
+
+        The mutable views share the result arrays and keep them alive even
+        after this result is released. The query index must be nonnegative.
+        """
         index = operator.index(index)
         if not 0 <= index < self.query_count:
             raise IndexError("range query index out of bounds")
         start, end = int(self.lims[index]), int(self.lims[index + 1])
-        return self.labels[start:end], self.distances[start:end]
+        return RangeSearchQueryResult(
+            self.labels[start:end], self.raw_distances[start:end]
+        )
 
 
 @dataclass(frozen=True)
@@ -494,8 +530,8 @@ def _range_result_copy(handle, query_count):
     ):
         raise RuntimeError("range result has invalid CSR limits")
     labels = _range_array_copy(view.labels, view.hit_count, np.int64, "labels")
-    distances = _range_array_copy(
-        view.distances, view.hit_count, np.float32, "distances"
+    raw_distances = _range_array_copy(
+        view.raw_distances, view.hit_count, np.float32, "raw_distances"
     )
     if query_count and not view.stats:
         raise RuntimeError("range result stats pointer is null")
@@ -508,7 +544,7 @@ def _range_result_copy(handle, query_count):
         )
         for index in range(query_count)
     )
-    return RangeSearchResult(lims, labels, distances, stats, view.list_reads)
+    return RangeSearchResult(lims, labels, raw_distances, stats, view.list_reads)
 
 
 def _int64_vector(value, name):
@@ -1014,7 +1050,7 @@ class VectorIndexReader:
             return bool(supported.value)
 
     def range_search(self, query, params: RangeSearchParams, roaring_filter=None):
-        """Search one query, returning an owned one-query CSR result.
+        """Search one query, returning owned CSR arrays with raw_distances.
 
         roaring_filter is optional serialized RoaringTreemap bytes. An empty
         byte string is still a supplied filter and is validated by core.
@@ -1024,7 +1060,7 @@ class VectorIndexReader:
     def range_search_batch(
         self, queries, params: RangeSearchParams, roaring_filter=None
     ):
-        """Search a query matrix; core rejects a zero-query batch."""
+        """Return raw_distances for a query matrix; core rejects empty batches."""
         return self._range_search(queries, params, roaring_filter, batch=True)
 
     def _range_search(self, value, params, roaring_filter, *, batch):
@@ -1180,6 +1216,7 @@ __all__ = [
     "DistanceEndpointOp",
     "IvfPqBatchTableReuseMode",
     "RangeSearchParams",
+    "RangeSearchQueryResult",
     "RangeSearchResult",
     "RangeSearchStats",
     "SearchParams",

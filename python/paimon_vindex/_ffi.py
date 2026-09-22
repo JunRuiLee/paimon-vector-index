@@ -157,13 +157,13 @@ class PaimonVindexSearchParamsV2(Structure):
     ]
 
 
-class PaimonVindexDistanceBand(Structure):
+class PaimonVindexRawDistanceBand(Structure):
     _fields_ = [
         ("metric", c_uint32),
-        ("lower_kind", c_uint32),
-        ("lower", c_float),
-        ("upper_kind", c_uint32),
-        ("upper", c_float),
+        ("raw_lower_kind", c_uint32),
+        ("raw_lower", c_float),
+        ("raw_upper_kind", c_uint32),
+        ("raw_upper", c_float),
     ]
 
 
@@ -176,7 +176,7 @@ class PaimonVindexDistanceEndpoint(Structure):
 
 class PaimonVindexRangeSearchParams(Structure):
     _fields_ = [
-        ("band", PaimonVindexDistanceBand),
+        ("band", PaimonVindexRawDistanceBand),
         ("nprobe", c_size_t),
     ]
 
@@ -196,7 +196,7 @@ class PaimonVindexRangeSearchResultView(Structure):
         ("hit_count", c_size_t),
         ("lims", POINTER(c_size_t)),
         ("labels", POINTER(c_int64)),
-        ("distances", POINTER(c_float)),
+        ("raw_distances", POINTER(c_float)),
         ("stats", POINTER(PaimonVindexRangeSearchStats)),
         ("list_reads", c_size_t),
     ]
@@ -391,7 +391,7 @@ def _configure_range_api():
             c_uint32,
             POINTER(PaimonVindexDistanceEndpoint),
             POINTER(PaimonVindexDistanceEndpoint),
-            POINTER(PaimonVindexDistanceBand),
+            POINTER(PaimonVindexRawDistanceBand),
         ], c_int),
         ("paimon_vindex_reader_supports_range_search", [
             c_void_p, POINTER(c_int),

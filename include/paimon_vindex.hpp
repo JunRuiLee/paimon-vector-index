@@ -229,30 +229,42 @@ struct SearchResult {
 using DistanceEndpoint = PaimonVindexDistanceEndpoint;
 using RangeSearchStats = PaimonVindexRangeSearchStats;
 
-struct DistanceBand {
-    uint32_t metric = PAIMON_VINDEX_METRIC_L2;
-    uint32_t lower_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
-    float lower = 0.0f;
-    uint32_t upper_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
-    float upper = 0.0f;
-
+class DistanceBand {
+public:
     static DistanceBand from_endpoints(
             uint32_t metric,
             std::optional<DistanceEndpoint> lower = std::nullopt,
             std::optional<DistanceEndpoint> upper = std::nullopt) {
-        PaimonVindexDistanceBand raw{};
+        PaimonVindexRawDistanceBand raw{};
         check(paimon_vindex_distance_band_from_endpoints(
             metric, lower ? &*lower : nullptr, upper ? &*upper : nullptr, &raw));
-        return {raw.metric, raw.lower_kind, raw.lower, raw.upper_kind, raw.upper};
+        return DistanceBand(raw);
     }
 
-    PaimonVindexDistanceBand to_ffi() const {
-        return {metric, lower_kind, lower, upper_kind, upper};
+    static DistanceBand from_raw(
+            uint32_t metric, uint32_t raw_lower_kind, float raw_lower,
+            uint32_t raw_upper_kind, float raw_upper) {
+        return DistanceBand({metric, raw_lower_kind, raw_lower, raw_upper_kind, raw_upper});
     }
+
+    uint32_t metric() const { return raw_.metric; }
+    uint32_t raw_lower_kind() const { return raw_.raw_lower_kind; }
+    float raw_lower() const { return raw_.raw_lower; }
+    uint32_t raw_upper_kind() const { return raw_.raw_upper_kind; }
+    float raw_upper() const { return raw_.raw_upper; }
+
+    PaimonVindexRawDistanceBand to_ffi() const { return raw_; }
+
+private:
+    explicit DistanceBand(PaimonVindexRawDistanceBand raw) : raw_(raw) {}
+
+    PaimonVindexRawDistanceBand raw_;
 };
 
 struct RangeSearchParams {
-    DistanceBand band;
+    DistanceBand band = DistanceBand::from_raw(
+        PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f,
+        PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f);
     size_t nprobe = 1;
 
     PaimonVindexRangeSearchParams to_ffi() const {
@@ -264,7 +276,7 @@ struct RangeSearchResult {
     size_t query_count = 0;
     std::vector<size_t> lims;
     std::vector<int64_t> labels;
-    std::vector<float> distances;
+    std::vector<float> raw_distances;
     std::vector<RangeSearchStats> stats;
     size_t list_reads = 0;
 };
@@ -279,7 +291,7 @@ inline RangeSearchResult copy_range_result(PaimonVindexRangeSearchResult* raw, i
     PaimonVindexRangeSearchResultView view{};
     check(paimon_vindex_range_search_result_view(guard.get(), &view));
     if (view.query_count == std::numeric_limits<size_t>::max() || !view.lims ||
-        (view.hit_count != 0 && (!view.labels || !view.distances)) ||
+        (view.hit_count != 0 && (!view.labels || !view.raw_distances)) ||
         (view.query_count != 0 && !view.stats)) {
         throw Error("invalid native range result view");
     }
@@ -288,7 +300,7 @@ inline RangeSearchResult copy_range_result(PaimonVindexRangeSearchResult* raw, i
     result.lims.assign(view.lims, view.lims + view.query_count + 1);
     if (view.hit_count != 0) {
         result.labels.assign(view.labels, view.labels + view.hit_count);
-        result.distances.assign(view.distances, view.distances + view.hit_count);
+        result.raw_distances.assign(view.raw_distances, view.raw_distances + view.hit_count);
     }
     if (view.query_count != 0) {
         result.stats.assign(view.stats, view.stats + view.query_count);

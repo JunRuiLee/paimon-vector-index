@@ -73,8 +73,8 @@ static void range_fill_data(float *data, int64_t *labels, float *queries) {
 static PaimonVindexRangeSearchParams range_all_params(uint32_t metric) {
     PaimonVindexRangeSearchParams params = {{0, 0, 0.0f, 0, 0.0f}, 0};
     params.band.metric = metric;
-    params.band.lower_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
-    params.band.upper_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
+    params.band.raw_lower_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
+    params.band.raw_upper_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
     params.nprobe = RANGE_NLIST;
     return params;
 }
@@ -83,7 +83,7 @@ static void range_assert_shape(const PaimonVindexRangeSearchResultView *view) {
     ASSERT_TRUE(view->lims != NULL);
     ASSERT_TRUE(view->lims[0] == 0);
     ASSERT_TRUE(view->lims[view->query_count] == view->hit_count);
-    ASSERT_TRUE(view->hit_count == 0 || (view->labels != NULL && view->distances != NULL));
+    ASSERT_TRUE(view->hit_count == 0 || (view->labels != NULL && view->raw_distances != NULL));
     ASSERT_TRUE(view->query_count == 0 || view->stats != NULL);
     for (size_t query = 0; query < view->query_count; ++query) {
         ASSERT_TRUE(view->lims[query] <= view->lims[query + 1]);
@@ -94,7 +94,7 @@ static void range_assert_shape(const PaimonVindexRangeSearchResultView *view) {
     }
     for (size_t hit = 0; hit < view->hit_count; ++hit) {
         ASSERT_TRUE(view->labels[hit] >= (INT64_C(1) << 40));
-        ASSERT_TRUE(isfinite(view->distances[hit]));
+        ASSERT_TRUE(isfinite(view->raw_distances[hit]));
     }
 }
 
@@ -118,7 +118,7 @@ struct RangeFixture {
     uint8_t *filter;
     size_t *lims;
     int64_t *labels;
-    uint32_t *distance_bits;
+    uint32_t *raw_distance_bits;
     PaimonVindexRangeSearchStats *stats;
     uint8_t *index_data;
     size_t index_len;
@@ -148,17 +148,17 @@ static void range_fixture_load(
         struct RangeFixture *fixture) {
     memset(fixture, 0, sizeof(*fixture));
     FILE *file = range_fixture_open(directory, name, ".expected");
-    uint32_t lower_bits;
-    uint32_t upper_bits;
+    uint32_t raw_lower_bits;
+    uint32_t raw_upper_bits;
     ASSERT_TRUE(fscanf(file, "%zu %" SCNu32 " %zu %zu %" SCNu32 " %" SCNu32
                       " %" SCNu32 " %" SCNu32 " %zu %zu %zu",
                       &fixture->dimension, &fixture->params.band.metric,
                       &fixture->query_count, &fixture->params.nprobe,
-                      &fixture->params.band.lower_kind, &lower_bits,
-                      &fixture->params.band.upper_kind, &upper_bits,
+                      &fixture->params.band.raw_lower_kind, &raw_lower_bits,
+                      &fixture->params.band.raw_upper_kind, &raw_upper_bits,
                       &fixture->filter_len, &fixture->hit_count, &fixture->list_reads) == 11);
-    fixture->params.band.lower = range_float_from_bits(lower_bits);
-    fixture->params.band.upper = range_float_from_bits(upper_bits);
+    fixture->params.band.raw_lower = range_float_from_bits(raw_lower_bits);
+    fixture->params.band.raw_upper = range_float_from_bits(raw_upper_bits);
     ASSERT_TRUE(fixture->dimension != 0);
     ASSERT_TRUE(fixture->query_count < SIZE_MAX);
     ASSERT_TRUE(fixture->query_count <= SIZE_MAX / fixture->dimension);
@@ -167,7 +167,7 @@ static void range_fixture_load(
     fixture->filter = (uint8_t *)range_fixture_allocate(fixture->filter_len, sizeof(uint8_t));
     fixture->lims = (size_t *)range_fixture_allocate(fixture->query_count + 1, sizeof(size_t));
     fixture->labels = (int64_t *)range_fixture_allocate(fixture->hit_count, sizeof(int64_t));
-    fixture->distance_bits = (uint32_t *)range_fixture_allocate(fixture->hit_count, sizeof(uint32_t));
+    fixture->raw_distance_bits = (uint32_t *)range_fixture_allocate(fixture->hit_count, sizeof(uint32_t));
     fixture->stats = (PaimonVindexRangeSearchStats *)range_fixture_allocate(
         fixture->query_count, sizeof(PaimonVindexRangeSearchStats));
     for (size_t element = 0; element < query_len; ++element) {
@@ -187,7 +187,7 @@ static void range_fixture_load(
         ASSERT_TRUE(fscanf(file, "%" SCNd64, &fixture->labels[element]) == 1);
     }
     for (size_t element = 0; element < fixture->hit_count; ++element) {
-        ASSERT_TRUE(fscanf(file, "%" SCNu32, &fixture->distance_bits[element]) == 1);
+        ASSERT_TRUE(fscanf(file, "%" SCNu32, &fixture->raw_distance_bits[element]) == 1);
     }
     for (size_t query = 0; query < fixture->query_count; ++query) {
         PaimonVindexRangeSearchStats *stats = &fixture->stats[query];
@@ -211,15 +211,15 @@ static void range_fixture_load(
 
 struct RangeFixtureHit {
     int64_t label;
-    uint32_t distance_bits;
+    uint32_t raw_distance_bits;
 };
 
 static int range_fixture_compare_hits(const void *left, const void *right) {
     const struct RangeFixtureHit *left_hit = (const struct RangeFixtureHit *)left;
     const struct RangeFixtureHit *right_hit = (const struct RangeFixtureHit *)right;
     if (left_hit->label != right_hit->label) return left_hit->label < right_hit->label ? -1 : 1;
-    if (left_hit->distance_bits != right_hit->distance_bits) {
-        return left_hit->distance_bits < right_hit->distance_bits ? -1 : 1;
+    if (left_hit->raw_distance_bits != right_hit->raw_distance_bits) {
+        return left_hit->raw_distance_bits < right_hit->raw_distance_bits ? -1 : 1;
     }
     return 0;
 }
@@ -238,9 +238,9 @@ static void range_fixture_assert(
         fixture->hit_count, sizeof(struct RangeFixtureHit));
     for (size_t hit = 0; hit < fixture->hit_count; ++hit) {
         actual[hit].label = view->labels[hit];
-        actual[hit].distance_bits = range_float_bits(view->distances[hit]);
+        actual[hit].raw_distance_bits = range_float_bits(view->raw_distances[hit]);
         expected[hit].label = fixture->labels[hit];
-        expected[hit].distance_bits = fixture->distance_bits[hit];
+        expected[hit].raw_distance_bits = fixture->raw_distance_bits[hit];
     }
     for (size_t query = 0; query < fixture->query_count; ++query) {
         size_t begin = fixture->lims[query];
@@ -273,7 +273,7 @@ static void range_fixture_run_all(void (*consume)(const struct RangeFixture *)) 
         free(fixture.filter);
         free(fixture.lims);
         free(fixture.labels);
-        free(fixture.distance_bits);
+        free(fixture.raw_distance_bits);
         free(fixture.stats);
         free(fixture.index_data);
         ++case_count;

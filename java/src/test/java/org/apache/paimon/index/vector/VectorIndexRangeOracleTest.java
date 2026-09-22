@@ -103,7 +103,7 @@ public class VectorIndexRangeOracleTest {
             require(metricCode >= 0 && metricCode < metrics.length, "metric code");
             VectorRangeSearchParams params =
                     new VectorRangeSearchParams(
-                            new VectorDistanceBand(metrics[metricCode], lower, upper), nprobe);
+                            VectorDistanceBand.fromRaw(metrics[metricCode], lower, upper), nprobe);
             try (VectorIndexReader reader =
                     new VectorIndexReader(
                             new VectorIndexNativeValidationTest.ByteArraySeekableInputStream(
@@ -170,7 +170,7 @@ public class VectorIndexRangeOracleTest {
                 hitIndex < result.queryEnd(queryIndex);
                 hitIndex++) {
             rows.computeIfAbsent(result.labelAt(hitIndex), label -> new ArrayList<Integer>())
-                    .add(Float.floatToRawIntBits(result.distanceAt(hitIndex)));
+                    .add(Float.floatToRawIntBits(result.rawDistanceAt(hitIndex)));
         }
         for (List<Integer> values : rows.values()) {
             Collections.sort(values);

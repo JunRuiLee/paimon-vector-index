@@ -27,6 +27,7 @@
 #include <cstring>
 #include <limits>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #define ASSERT_EQ(a, b) do { \
@@ -44,6 +45,24 @@
 } while (0)
 
 #include "../c/range_test_support.h"
+
+static_assert(!std::is_aggregate_v<paimon::vindex::DistanceBand>);
+static_assert(!std::is_default_constructible_v<paimon::vindex::DistanceBand>);
+static_assert(!std::is_constructible_v<paimon::vindex::DistanceBand,
+                                     uint32_t, uint32_t, float, uint32_t, float>);
+static_assert(!std::is_constructible_v<paimon::vindex::DistanceBand, PaimonVindexRawDistanceBand>);
+static_assert(std::is_same_v<decltype(paimon::vindex::RangeSearchResult::raw_distances),
+                             std::vector<float>>);
+static_assert(std::is_same_v<decltype(paimon::vindex::SearchResult::distances), std::vector<float>>);
+
+template <typename Result, typename = void>
+struct HasDistances : std::false_type {};
+
+template <typename Result>
+struct HasDistances<Result, std::void_t<decltype(std::declval<Result>().distances)>> : std::true_type {};
+
+static_assert(!HasDistances<paimon::vindex::RangeSearchResult>::value);
+static_assert(HasDistances<paimon::vindex::SearchResult>::value);
 
 struct MemBuffer {
     std::vector<uint8_t> data;
@@ -366,14 +385,15 @@ static void assert_range_error(Operation operation) {
 static PaimonVindexRangeSearchResultView range_view(
         const paimon::vindex::RangeSearchResult& result) {
     return {result.query_count, result.labels.size(), result.lims.data(),
-            result.labels.data(), result.distances.data(), result.stats.data(),
+            result.labels.data(), result.raw_distances.data(), result.stats.data(),
             result.list_reads};
 }
 
 static paimon::vindex::RangeSearchParams range_cpp_params(
         PaimonVindexRangeSearchParams raw) {
-    return {{raw.band.metric, raw.band.lower_kind, raw.band.lower,
-             raw.band.upper_kind, raw.band.upper}, raw.nprobe};
+    return {paimon::vindex::DistanceBand::from_raw(
+                raw.band.metric, raw.band.raw_lower_kind, raw.band.raw_lower,
+                raw.band.raw_upper_kind, raw.band.raw_upper), raw.nprobe};
 }
 
 static void consume_range_fixture(const RangeFixture* fixture) {
@@ -403,6 +423,86 @@ static void consume_range_fixture(const RangeFixture* fixture) {
     range_fixture_assert(fixture, &view);
 }
 
+static void test_range_raw_factory() {
+    using namespace paimon::vindex;
+    for (uint32_t metric : {PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_METRIC_INNER_PRODUCT}) {
+        const float raw_lower = metric == PAIMON_VINDEX_METRIC_L2 ? 4.0f : -6.0f;
+        const float raw_upper = metric == PAIMON_VINDEX_METRIC_L2 ? 9.0f : -5.0f;
+        const auto band = DistanceBand::from_raw(
+            metric, PAIMON_VINDEX_BOUND_FINITE, raw_lower, PAIMON_VINDEX_BOUND_FINITE, raw_upper);
+        ASSERT_EQ(band.metric(), metric);
+        ASSERT_EQ(band.raw_lower_kind(), PAIMON_VINDEX_BOUND_FINITE);
+        ASSERT_EQ(band.raw_lower(), raw_lower);
+        ASSERT_EQ(band.raw_upper_kind(), PAIMON_VINDEX_BOUND_FINITE);
+        ASSERT_EQ(band.raw_upper(), raw_upper);
+        auto raw = band.to_ffi();
+        ASSERT_EQ(raw.metric, band.metric());
+        ASSERT_EQ(raw.raw_lower_kind, band.raw_lower_kind());
+        ASSERT_EQ(range_float_bits(raw.raw_lower), range_float_bits(raw_lower));
+        ASSERT_EQ(raw.raw_upper_kind, band.raw_upper_kind());
+        ASSERT_EQ(range_float_bits(raw.raw_upper), range_float_bits(raw_upper));
+    }
+    const RangeSearchParams defaults;
+    ASSERT_EQ(defaults.band.metric(), PAIMON_VINDEX_METRIC_L2);
+    ASSERT_EQ(defaults.band.raw_lower_kind(), PAIMON_VINDEX_BOUND_UNBOUNDED);
+    ASSERT_EQ(defaults.band.raw_upper_kind(), PAIMON_VINDEX_BOUND_UNBOUNDED);
+    ASSERT_EQ(defaults.nprobe, 1);
+    printf("PASS range_raw_factory\n");
+}
+
+static void test_range_endpoint_raw_results() {
+    using namespace paimon::vindex;
+    const char* metrics[] = {"l2", "inner_product"};
+    const uint32_t metric_codes[] = {PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_METRIC_INNER_PRODUCT};
+    const float coordinates[][3] = {{3.0f, 4.0f, 5.0f}, {3.0f, 2.5f, 2.0f}};
+    const float expected_raw_distances[][2] = {{9.0f, 16.0f}, {-6.0f, -5.0f}};
+    const std::vector<int64_t> labels = {
+        INT64_C(1) << 40, (INT64_C(1) << 40) + 1, (INT64_C(1) << 40) + 2};
+    for (size_t metric_index = 0; metric_index < 2; ++metric_index) {
+        RangeSearchResult result;
+        {
+            std::vector<float> data(3 * RANGE_DIMENSION);
+            std::vector<float> query(RANGE_DIMENSION);
+            for (size_t row = 0; row < 3; ++row) {
+                data[row * RANGE_DIMENSION] = coordinates[metric_index][row];
+            }
+            if (metric_codes[metric_index] == PAIMON_VINDEX_METRIC_INNER_PRODUCT) query[0] = 2.0f;
+            Trainer trainer({{"index.type", "ivf_flat"}, {"dimension", "8"},
+                             {"nlist", "1"}, {"metric", metrics[metric_index]}});
+            Writer writer(trainer.add_training_vectors(data.data(), 3).finish_training());
+            writer.add_vectors(labels.data(), data.data(), 3);
+            MemBuffer buffer;
+            writer.write_index(make_output(buffer));
+            Reader reader(make_input(buffer));
+            const auto band = metric_index == 0
+                ? DistanceBand::from_endpoints(metric_codes[metric_index], std::nullopt,
+                                              DistanceEndpoint{4.0, PAIMON_VINDEX_CUT_LE})
+                : DistanceBand::from_endpoints(metric_codes[metric_index],
+                                              DistanceEndpoint{5.0, PAIMON_VINDEX_CUT_GE});
+            result = reader.range_search(query, RangeSearchParams{band, 1});
+            const auto raw_band = DistanceBand::from_raw(
+                band.metric(), band.raw_lower_kind(), band.raw_lower(),
+                band.raw_upper_kind(), band.raw_upper());
+            auto raw_result = reader.range_search(query, RangeSearchParams{raw_band, 1});
+            ASSERT_TRUE(result.labels == raw_result.labels);
+            ASSERT_TRUE(result.raw_distances == raw_result.raw_distances);
+        }
+        const auto view = range_view(result);
+        range_assert_shape(&view);
+        ASSERT_EQ(result.query_count, 1);
+        ASSERT_EQ(result.labels.size(), 2);
+        ASSERT_EQ(result.raw_distances.size(), 2);
+        for (size_t expected = 0; expected < 2; ++expected) {
+            ASSERT_EQ(std::count(result.labels.begin(), result.labels.end(), labels[expected]), 1);
+            auto found = std::find(result.labels.begin(), result.labels.end(), labels[expected]);
+            size_t hit = static_cast<size_t>(found - result.labels.begin());
+            ASSERT_EQ(range_float_bits(result.raw_distances[hit]),
+                      range_float_bits(expected_raw_distances[metric_index][expected]));
+        }
+        printf("PASS range_endpoint_raw_results %s\n", metrics[metric_index]);
+    }
+}
+
 static void test_range_endpoints() {
     using namespace paimon::vindex;
     for (uint32_t metric : {PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_METRIC_COSINE,
@@ -411,31 +511,31 @@ static void test_range_endpoints() {
             for (uint32_t upper_op : {PAIMON_VINDEX_CUT_LE, PAIMON_VINDEX_CUT_LT}) {
                 auto band = DistanceBand::from_endpoints(
                     metric, DistanceEndpoint{0.5, lower_op}, DistanceEndpoint{1.0, upper_op});
-                for (float distance : {-1.0f, -0.5f, -0.0f, 0.0f, 0.25f,
+                for (float raw_distance : {-1.0f, -0.5f, -0.0f, 0.0f, 0.25f,
                                        std::nextafter(0.25f, 0.0f), 0.5f, 1.0f,
                                        std::nextafter(1.0f, 2.0f), 4.0f}) {
-                    if (metric == PAIMON_VINDEX_METRIC_L2 && distance < 0) continue;
+                    if (metric == PAIMON_VINDEX_METRIC_L2 && raw_distance < 0) continue;
                     double public_value = metric == PAIMON_VINDEX_METRIC_L2
-                        ? static_cast<double>(std::sqrt(distance))
+                        ? static_cast<double>(std::sqrt(raw_distance))
                         : metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT
-                            ? -static_cast<double>(distance) : static_cast<double>(distance);
+                            ? -static_cast<double>(raw_distance) : static_cast<double>(raw_distance);
                     bool expected = (lower_op == PAIMON_VINDEX_CUT_GE
                         ? public_value >= 0.5 : public_value > 0.5) &&
                         (upper_op == PAIMON_VINDEX_CUT_LE ? public_value <= 1.0 : public_value < 1.0);
                     ASSERT_EQ(expected,
-                        (band.lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || distance >= band.lower) &&
-                        (band.upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || distance < band.upper));
+                        (band.raw_lower_kind() == PAIMON_VINDEX_BOUND_UNBOUNDED || raw_distance >= band.raw_lower()) &&
+                        (band.raw_upper_kind() == PAIMON_VINDEX_BOUND_UNBOUNDED || raw_distance < band.raw_upper()));
                 }
             }
         }
         auto unbounded = DistanceBand::from_endpoints(metric);
-        ASSERT_EQ(unbounded.lower_kind, PAIMON_VINDEX_BOUND_UNBOUNDED);
-        ASSERT_EQ(unbounded.upper_kind, PAIMON_VINDEX_BOUND_UNBOUNDED);
+        ASSERT_EQ(unbounded.raw_lower_kind(), PAIMON_VINDEX_BOUND_UNBOUNDED);
+        ASSERT_EQ(unbounded.raw_upper_kind(), PAIMON_VINDEX_BOUND_UNBOUNDED);
         auto precise = DistanceBand::from_endpoints(
             metric, DistanceEndpoint{std::nextafter(1.0, 2.0), PAIMON_VINDEX_CUT_GE});
-        float boundary = metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT ? -1.0f : 1.0f;
-        ASSERT_TRUE(!((precise.lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || boundary >= precise.lower) &&
-                      (precise.upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || boundary < precise.upper)));
+        float raw_boundary = metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT ? -1.0f : 1.0f;
+        ASSERT_TRUE(!((precise.raw_lower_kind() == PAIMON_VINDEX_BOUND_UNBOUNDED || raw_boundary >= precise.raw_lower()) &&
+                      (precise.raw_upper_kind() == PAIMON_VINDEX_BOUND_UNBOUNDED || raw_boundary < precise.raw_upper())));
     }
     assert_range_error([] {
         DistanceBand::from_endpoints(PAIMON_VINDEX_METRIC_L2,
@@ -506,12 +606,11 @@ static void test_range_matrix() {
                 ASSERT_TRUE(empty_filter.labels.empty());
                 ASSERT_TRUE(empty_filter.lims == std::vector<size_t>({0, 0}));
                 auto bounded = params;
-                auto bounds = std::minmax_element(retained.distances.begin(), retained.distances.end());
-                bounded.band.lower_kind = PAIMON_VINDEX_BOUND_FINITE;
-                bounded.band.lower = metric.second == PAIMON_VINDEX_METRIC_L2
-                    ? std::max(0.0f, *bounds.first) : *bounds.first;
-                bounded.band.upper_kind = PAIMON_VINDEX_BOUND_FINITE;
-                bounded.band.upper = *bounds.first + (*bounds.second - *bounds.first) / 2.0f;
+                auto bounds = std::minmax_element(retained.raw_distances.begin(), retained.raw_distances.end());
+                bounded.band = DistanceBand::from_raw(
+                    metric.second, PAIMON_VINDEX_BOUND_FINITE,
+                    metric.second == PAIMON_VINDEX_METRIC_L2 ? std::max(0.0f, *bounds.first) : *bounds.first,
+                    PAIMON_VINDEX_BOUND_FINITE, *bounds.first + (*bounds.second - *bounds.first) / 2.0f);
                 auto subset = reader.range_search_batch(queries, RANGE_QUERY_COUNT, bounded);
                 auto subset_view = range_view(subset);
                 range_assert_shape(&subset_view);
@@ -519,7 +618,8 @@ static void test_range_matrix() {
                 for (size_t query_index = 0; query_index < RANGE_QUERY_COUNT; ++query_index) {
                     size_t expected = 0;
                     for (size_t hit = batch.lims[query_index]; hit < batch.lims[query_index + 1]; ++hit) {
-                        if (batch.distances[hit] >= bounded.band.lower && batch.distances[hit] < bounded.band.upper) {
+                        if (batch.raw_distances[hit] >= bounded.band.raw_lower() &&
+                            batch.raw_distances[hit] < bounded.band.raw_upper()) {
                             ++expected;
                             ASSERT_TRUE(std::find(subset.labels.begin() + subset.lims[query_index],
                                 subset.labels.begin() + subset.lims[query_index + 1], batch.labels[hit]) !=
@@ -528,9 +628,11 @@ static void test_range_matrix() {
                     }
                     ASSERT_EQ(subset.lims[query_index + 1] - subset.lims[query_index], expected);
                 }
-                bounded.band.lower = bounded.band.upper;
+                bounded.band = DistanceBand::from_raw(
+                    metric.second, PAIMON_VINDEX_BOUND_FINITE, bounded.band.raw_upper(),
+                    PAIMON_VINDEX_BOUND_FINITE, bounded.band.raw_upper());
                 auto empty = reader.range_search_batch(queries, RANGE_QUERY_COUNT, bounded);
-                ASSERT_TRUE(empty.labels.empty() && empty.distances.empty());
+                ASSERT_TRUE(empty.labels.empty() && empty.raw_distances.empty());
                 ASSERT_TRUE(empty.lims == std::vector<size_t>({0, 0, 0, 0}));
                 ASSERT_EQ(empty.list_reads, 0);
                 assert_range_error([&] { reader.range_search(nullptr, RANGE_DIMENSION, params); });
@@ -579,7 +681,9 @@ static void test_range_matrix() {
                 invalid.nprobe = 0;
                 assert_range_error([&] { reader.range_search(query, invalid); });
                 invalid = params;
-                invalid.band.metric = (metric.second + 1) % 3;
+                invalid.band = DistanceBand::from_raw(
+                    (metric.second + 1) % 3, params.band.raw_lower_kind(), params.band.raw_lower(),
+                    params.band.raw_upper_kind(), params.band.raw_upper());
                 assert_range_error([&] { reader.range_search(query, invalid); });
                 auto nan_query = query;
                 nan_query[0] = std::numeric_limits<float>::quiet_NaN();
@@ -603,6 +707,8 @@ int main() {
     test_worker_callback_reentry_is_rejected();
     test_extensible_search_params_forward_query_tuning();
     test_range_endpoints();
+    test_range_raw_factory();
+    test_range_endpoint_raw_results();
     test_range_matrix();
     range_fixture_run_all(consume_range_fixture);
     return 0;

@@ -23,6 +23,8 @@ import static org.apache.paimon.index.vector.VectorDistanceBand.CutOperator.LE;
 import static org.apache.paimon.index.vector.VectorDistanceBand.CutOperator.LT;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -48,21 +50,43 @@ public class VectorIndexRangeSearchTest {
     }
 
     static void testValueTypes() {
+        testRawApiContract();
         testNativeResultOwnership();
         testIndexedResultAccess();
-        VectorDistanceBand band = new VectorDistanceBand("l2", null, 4.0f);
-        check(band.lower() == null && band.upper() == 4.0f, "structural bounds");
+        VectorDistanceBand band = VectorDistanceBand.fromRaw("l2", null, 4.0f);
+        check(band.rawLower() == null && band.rawUpper() == 4.0f, "structural bounds");
         check("l2".equals(band.metric()), "metric");
+        VectorDistanceBand rawL2 = VectorDistanceBand.fromRaw("l2", -0.0f, 16.0f);
+        check(
+                Float.floatToRawIntBits(rawL2.rawLower()) == 0x80000000
+                        && rawL2.rawUpper() == 16.0f,
+                "raw L2 cuts retain signed zero and squared distances");
+        VectorDistanceBand rawIp = VectorDistanceBand.fromRaw("inner_product", -6.0f, -5.0f);
+        check(
+                rawIp.rawLower() == -6.0f && rawIp.rawUpper() == -5.0f,
+                "raw inner product cuts are not negated");
+        VectorDistanceBand rawCosine = VectorDistanceBand.fromRaw("cosine", 0.25f, 0.75f);
+        check(
+                rawCosine.rawLower() == 0.25f && rawCosine.rawUpper() == 0.75f,
+                "raw cosine cuts are unchanged");
+        VectorDistanceBand rawUnbounded = VectorDistanceBand.fromRaw("l2", null, null);
+        check(
+                rawUnbounded.rawLower() == null && rawUnbounded.rawUpper() == null,
+                "raw unbounded cuts remain structural");
         check(new VectorRangeSearchParams(band, 2).nprobe() == 2, "nprobe");
         expect(IllegalArgumentException.class, () -> new VectorRangeSearchParams(band, 0));
         expect(NullPointerException.class, () -> new VectorRangeSearchParams(null, 1));
-        expect(IllegalArgumentException.class, () -> new VectorDistanceBand("other", null, null));
-        expect(IllegalArgumentException.class, () -> new VectorDistanceBand("l2", -1.0f, null));
-        expect(IllegalArgumentException.class, () -> new VectorDistanceBand("cosine", 2.0f, 1.0f));
-        expect(IllegalArgumentException.class, () -> new VectorDistanceBand("l2", null, Float.NaN));
+        expect(NullPointerException.class, () -> VectorDistanceBand.fromRaw(null, null, null));
+        expect(IllegalArgumentException.class, () -> VectorDistanceBand.fromRaw("other", null, null));
+        expect(IllegalArgumentException.class, () -> VectorDistanceBand.fromRaw("l2", -1.0f, null));
+        expect(IllegalArgumentException.class, () -> VectorDistanceBand.fromRaw("cosine", 2.0f, 1.0f));
+        expect(IllegalArgumentException.class, () -> VectorDistanceBand.fromRaw("l2", null, Float.NaN));
         expect(
                 IllegalArgumentException.class,
-                () -> new VectorDistanceBand("cosine", Float.NEGATIVE_INFINITY, null));
+                () -> VectorDistanceBand.fromRaw("cosine", Float.NEGATIVE_INFINITY, null));
+        expect(
+                IllegalArgumentException.class,
+                () -> VectorDistanceBand.fromRaw("inner_product", null, Float.POSITIVE_INFINITY));
 
         long[] labels = {LABEL_BASE, 7};
         float[] distances = {1, 3};
@@ -78,15 +102,15 @@ public class VectorIndexRangeSearchTest {
         check(result.queryCount() == 2 && result.listReads() == 2, "result shape");
         check(result.labelsForQuery(0).length == 0, "empty first row");
         check(result.labelsForQuery(1)[0] == LABEL_BASE, "64-bit label and copy");
-        check(result.distancesForQuery(1)[0] == 1, "distance copy");
+        check(result.rawDistancesForQuery(1)[0] == 1, "distance copy");
         result.labels()[0] = -2;
-        result.distances()[0] = -2;
+        result.rawDistances()[0] = -2;
         result.lims()[1] = 2;
         result.listsProbed()[1] = -2;
         result.rowsScanned()[1] = -2;
         result.rowsCommitted()[1] = -2;
         result.earlyAbandoned()[1] = -2;
-        check(result.labels()[0] == LABEL_BASE && result.distances()[0] == 1, "defensive arrays");
+        check(result.labels()[0] == LABEL_BASE && result.rawDistances()[0] == 1, "defensive arrays");
         check(result.lims()[1] == 0 && result.listsProbed()[1] == 2, "defensive CSR and stats");
         check(
                 result.rowsScanned()[1] == 2
@@ -94,7 +118,7 @@ public class VectorIndexRangeSearchTest {
                         && result.earlyAbandoned()[1] == 0,
                 "defensive counters");
         expect(IndexOutOfBoundsException.class, () -> result.labelsForQuery(-1));
-        expect(IndexOutOfBoundsException.class, () -> result.distancesForQuery(2));
+        expect(IndexOutOfBoundsException.class, () -> result.rawDistancesForQuery(2));
         expect(
                 IllegalArgumentException.class,
                 () ->
@@ -148,6 +172,63 @@ public class VectorIndexRangeSearchTest {
         expect(NullPointerException.class, () -> closed.rangeSearch(new float[1], params, null));
     }
 
+    private static void testRawApiContract() {
+        for (Method method : VectorRangeSearchResult.class.getMethods()) {
+            check(
+                    !"distances".equals(method.getName())
+                            && !"distanceAt".equals(method.getName())
+                            && !"distancesForQuery".equals(method.getName()),
+                    "ambiguous public range result method: " + method.getName());
+        }
+        check(
+                VectorDistanceBand.class.getConstructors().length == 0,
+                "raw distance band constructor must not be public");
+        for (Method method : VectorDistanceBand.class.getMethods()) {
+            check(
+                    !"lower".equals(method.getName()) && !"upper".equals(method.getName()),
+                    "ambiguous public distance band method: " + method.getName());
+        }
+        try {
+            check(
+                    VectorRangeSearchResult.class.getMethod("rawDistances").getReturnType()
+                            == float[].class,
+                    "raw distance array accessor");
+            check(
+                    VectorRangeSearchResult.class.getMethod("rawDistanceAt", int.class)
+                                    .getReturnType()
+                            == float.class,
+                    "raw distance indexed accessor");
+            check(
+                    VectorRangeSearchResult.class.getMethod("rawDistancesForQuery", int.class)
+                                    .getReturnType()
+                            == float[].class,
+                    "raw distance query accessor");
+            check(
+                    Modifier.isPrivate(
+                            VectorRangeSearchResult.class.getDeclaredField("rawDistances")
+                                    .getModifiers()),
+                    "raw distance storage is private");
+            Method factory =
+                    VectorDistanceBand.class.getMethod(
+                            "fromRaw", String.class, Float.class, Float.class);
+            check(
+                    Modifier.isStatic(factory.getModifiers())
+                            && factory.getReturnType() == VectorDistanceBand.class,
+                    "explicit raw band factory");
+            for (String bound : new String[] {"rawLower", "rawUpper"}) {
+                check(
+                        VectorDistanceBand.class.getMethod(bound).getReturnType() == Float.class,
+                        "raw bound accessor: " + bound);
+                check(
+                        Modifier.isPrivate(
+                                VectorDistanceBand.class.getDeclaredField(bound).getModifiers()),
+                        "raw bound storage is private: " + bound);
+            }
+        } catch (ReflectiveOperationException error) {
+            throw new AssertionError(error);
+        }
+    }
+
     private static void testIndexedResultAccess() {
         long[] labels = {Long.MIN_VALUE, LABEL_BASE, Long.MAX_VALUE};
         float[] distances = {-0.0f, 1.5f, Float.POSITIVE_INFINITY};
@@ -182,20 +263,20 @@ public class VectorIndexRangeSearchTest {
                         hitIndex++) {
                     check(result.labelAt(hitIndex) == labels[hitIndex], "indexed label");
                     check(
-                            Float.floatToRawIntBits(result.distanceAt(hitIndex))
+                            Float.floatToRawIntBits(result.rawDistanceAt(hitIndex))
                                     == Float.floatToRawIntBits(distances[hitIndex]),
                             "indexed distance bits");
                 }
             }
             result.labels()[0] = 0;
-            result.distances()[0] = 1;
+            result.rawDistances()[0] = 1;
             result.lims()[1] = 1;
             result.listsProbed()[1] = 0;
             result.rowsScanned()[1] = 0;
             result.rowsCommitted()[1] = 0;
             result.earlyAbandoned()[1] = 0;
             check(result.labelAt(0) == Long.MIN_VALUE, "indexed labels remain immutable");
-            check(Float.floatToRawIntBits(result.distanceAt(0)) == 0x80000000, "signed zero retained");
+            check(Float.floatToRawIntBits(result.rawDistanceAt(0)) == 0x80000000, "signed zero retained");
             check(result.queryEnd(0) == 0, "indexed offsets remain immutable");
             check(
                     result.listsProbed(1) == 4 && result.rowsScanned(1) == Long.MAX_VALUE,
@@ -205,7 +286,7 @@ public class VectorIndexRangeSearchTest {
                     "indexed counters remain immutable");
             for (int hitIndex : new int[] {-1, result.hitCount(), Integer.MAX_VALUE}) {
                 expect(IndexOutOfBoundsException.class, () -> result.labelAt(hitIndex));
-                expect(IndexOutOfBoundsException.class, () -> result.distanceAt(hitIndex));
+                expect(IndexOutOfBoundsException.class, () -> result.rawDistanceAt(hitIndex));
             }
             for (int queryIndex : new int[] {-1, result.queryCount(), Integer.MAX_VALUE}) {
                 checkInvalidQueryIndex(result, queryIndex);
@@ -224,12 +305,13 @@ public class VectorIndexRangeSearchTest {
                         "empty query bounds");
             }
             expect(IndexOutOfBoundsException.class, () -> empty.labelAt(0));
-            expect(IndexOutOfBoundsException.class, () -> empty.distanceAt(0));
+            expect(IndexOutOfBoundsException.class, () -> empty.rawDistanceAt(0));
             checkInvalidQueryIndex(empty, empty.queryCount());
         }
     }
 
     private static void checkInvalidQueryIndex(VectorRangeSearchResult result, int queryIndex) {
+        expect(IndexOutOfBoundsException.class, () -> result.rawDistancesForQuery(queryIndex));
         expect(IndexOutOfBoundsException.class, () -> result.queryStart(queryIndex));
         expect(IndexOutOfBoundsException.class, () -> result.queryEnd(queryIndex));
         expect(IndexOutOfBoundsException.class, () -> result.listsProbed(queryIndex));
@@ -258,7 +340,7 @@ public class VectorIndexRangeSearchTest {
         double distanceSum = 0;
         for (int hitIndex = result.queryStart(1); hitIndex < result.queryEnd(1); hitIndex++) {
             labelSum += result.labelAt(hitIndex);
-            distanceSum += result.distanceAt(hitIndex);
+            distanceSum += result.rawDistanceAt(hitIndex);
         }
         check(labelSum == 2 * LABEL_BASE + 1 && distanceSum == -2.25, "large result consumption");
         check(result.listsProbed(1) == 1 && result.rowsScanned(1) == hitCount, "large result stats");
@@ -286,25 +368,25 @@ public class VectorIndexRangeSearchTest {
                         earlyAbandoned,
                         1);
         checkOwnedArray(result, "labels", labels);
-        checkOwnedArray(result, "distances", distances);
+        checkOwnedArray(result, "rawDistances", distances);
         checkOwnedArray(result, "lims", lims);
         checkOwnedArray(result, "listsProbed", listsProbed);
         checkOwnedArray(result, "rowsScanned", rowsScanned);
         checkOwnedArray(result, "rowsCommitted", rowsCommitted);
         checkOwnedArray(result, "earlyAbandoned", earlyAbandoned);
         result.labels()[0] = -1;
-        result.distances()[0] = -1;
+        result.rawDistances()[0] = -1;
         result.lims()[1] = 2;
         result.listsProbed()[1] = -1;
         result.rowsScanned()[1] = -1;
         result.rowsCommitted()[1] = -1;
         result.earlyAbandoned()[1] = -1;
         result.labelsForQuery(1)[0] = -1;
-        result.distancesForQuery(1)[0] = -1;
+        result.rawDistancesForQuery(1)[0] = -1;
         check(result.queryCount() == 2 && result.listReads() == 1, "owned result shape");
         check(result.labelsForQuery(0).length == 0, "owned empty query");
         check(result.labelsForQuery(1)[0] == LABEL_BASE, "owned labels remain defensive");
-        check(result.distancesForQuery(1)[0] == 1, "owned distances remain defensive");
+        check(result.rawDistancesForQuery(1)[0] == 1, "owned distances remain defensive");
         check(result.lims()[1] == 0 && result.listsProbed()[1] == 1, "owned CSR and stats");
         check(
                 result.rowsScanned()[1] == 3
@@ -361,6 +443,7 @@ public class VectorIndexRangeSearchTest {
             }
         }
         testExactDistancesAndEndpoints();
+        testEndpointSearchReturnsRawDistances();
         testNativeValidation();
         testBatchMetadataTransfer();
         testCallbacks();
@@ -419,8 +502,8 @@ public class VectorIndexRangeSearchTest {
                             batch.labelAt(expectedStart + hitIndex) == single.labelAt(hitIndex),
                             "retained batch label");
                     check(
-                            Float.floatToRawIntBits(batch.distanceAt(expectedStart + hitIndex))
-                                    == Float.floatToRawIntBits(single.distanceAt(hitIndex)),
+                            Float.floatToRawIntBits(batch.rawDistanceAt(expectedStart + hitIndex))
+                                    == Float.floatToRawIntBits(single.rawDistanceAt(hitIndex)),
                             "retained batch distance bits");
                 }
                 expectedStart += single.hitCount();
@@ -450,7 +533,7 @@ public class VectorIndexRangeSearchTest {
                 check(full.listsProbed()[queryIndex] == 2, "lists probed");
                 check(full.rowsScanned()[queryIndex] == VECTOR_COUNT, "rows scanned");
             }
-            float[] sorted = full.distancesForQuery(0);
+            float[] sorted = full.rawDistancesForQuery(0);
             Arrays.sort(sorted);
             Float lower = sorted[VECTOR_COUNT / 4];
             Float upper = sorted[VECTOR_COUNT * 3 / 4];
@@ -562,17 +645,17 @@ public class VectorIndexRangeSearchTest {
         VectorDistanceBand unbounded =
                 VectorDistanceBand.fromEndpoints("inner_product", null, null, null, null);
         check(
-                unbounded.lower() == null && unbounded.upper() == null,
+                unbounded.rawLower() == null && unbounded.rawUpper() == null,
                 "unbounded endpoint conversion");
         VectorDistanceBand outside =
                 VectorDistanceBand.fromEndpoints(
                         "cosine", -Double.MAX_VALUE, GE, Double.MAX_VALUE, LE);
         check(
-                outside.lower() == -Float.MAX_VALUE && outside.upper() == null,
+                outside.rawLower() == -Float.MAX_VALUE && outside.rawUpper() == null,
                 "linear out-of-domain endpoints retain core cuts and unbounded upper");
         VectorDistanceBand equal = VectorDistanceBand.fromEndpoints("l2", 1.0, GE, 1.0, LE);
         check(
-                equal.lower() <= 1.0f && equal.upper() > 1.0f,
+                equal.rawLower() <= 1.0f && equal.rawUpper() > 1.0f,
                 "inclusive equal endpoints retain equality bucket");
         expect(
                 RuntimeException.class,
@@ -589,6 +672,96 @@ public class VectorIndexRangeSearchTest {
         expect(
                 RuntimeException.class,
                 () -> VectorIndexNative.distanceBandFromEndpoints("l2", 1.0, 4, null, -1));
+    }
+
+    private static void testEndpointSearchReturnsRawDistances() {
+        assertEndpointSearchReturnsRawDistances(
+                "l2",
+                new float[] {3, 0, 4, 0, 0, 3, 5, 0},
+                new float[] {0, 0},
+                VectorDistanceBand.fromEndpoints("l2", null, null, 4.0, LT),
+                new long[] {LABEL_BASE, LABEL_BASE + 2},
+                new float[] {9.0f, 9.0f});
+        assertEndpointSearchReturnsRawDistances(
+                "inner_product",
+                new float[] {3, 0, 2, 0, 4, 0, 2.5f, 0},
+                new float[] {2, 0},
+                VectorDistanceBand.fromEndpoints("inner_product", 5.0, GE, null, null),
+                new long[] {LABEL_BASE, LABEL_BASE + 2, LABEL_BASE + 3},
+                new float[] {-6.0f, -8.0f, -5.0f});
+        assertEndpointSearchReturnsRawDistances(
+                "cosine",
+                new float[] {1, 0, 0, 1, 1, 1, -1, 0},
+                new float[] {1, 0},
+                VectorDistanceBand.fromEndpoints("cosine", null, null, 1.0, LT),
+                new long[] {LABEL_BASE, LABEL_BASE + 2},
+                new float[] {0.0f, (float) (1.0 - 1.0 / Math.sqrt(2.0))});
+    }
+
+    private static void assertEndpointSearchReturnsRawDistances(
+            String metric,
+            float[] data,
+            float[] query,
+            VectorDistanceBand endpointBand,
+            long[] expectedLabels,
+            float[] expectedRawDistances) {
+        VectorDistanceBand rawBand =
+                VectorDistanceBand.fromRaw(
+                        metric, endpointBand.rawLower(), endpointBand.rawUpper());
+        float[] queries = new float[query.length * 2];
+        System.arraycopy(query, 0, queries, 0, query.length);
+        System.arraycopy(query, 0, queries, query.length, query.length);
+        try (VectorIndexReader reader = open(build("ivf_flat", metric, 2, data))) {
+            for (VectorDistanceBand band : new VectorDistanceBand[] {endpointBand, rawBand}) {
+                VectorRangeSearchParams params = new VectorRangeSearchParams(band, 2);
+                for (boolean filtered : new boolean[] {false, true}) {
+                    Map<Long, Float> expected = new HashMap<Long, Float>();
+                    for (int hitIndex = 0; hitIndex < expectedLabels.length; hitIndex++) {
+                        long label = expectedLabels[hitIndex];
+                        if (!filtered || label == LABEL_BASE || label == LABEL_BASE + 1) {
+                            expected.put(label, expectedRawDistances[hitIndex]);
+                        }
+                    }
+                    VectorRangeSearchResult single =
+                            filtered
+                                    ? reader.rangeSearch(query, params, filter())
+                                    : reader.rangeSearch(query, params);
+                    VectorRangeSearchResult batch =
+                            filtered
+                                    ? reader.rangeSearchBatch(queries, 2, params, filter())
+                                    : reader.rangeSearchBatch(queries, 2, params);
+                    assertShape(single, 1);
+                    assertShape(batch, 2);
+                    assertRawValues(single, 0, expected);
+                    for (int queryIndex = 0; queryIndex < batch.queryCount(); queryIndex++) {
+                        assertRows(single, 0, batch, queryIndex);
+                        assertRawValues(batch, queryIndex, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void assertRawValues(
+            VectorRangeSearchResult result, int queryIndex, Map<Long, Float> expected) {
+        check(rows(result, queryIndex).keySet().equals(expected.keySet()), "endpoint membership");
+        float[] rawDistances = result.rawDistances();
+        float[] queryRawDistances = result.rawDistancesForQuery(queryIndex);
+        for (int hitIndex = result.queryStart(queryIndex);
+                hitIndex < result.queryEnd(queryIndex);
+                hitIndex++) {
+            float rawDistance = result.rawDistanceAt(hitIndex);
+            check(
+                    Math.abs(rawDistance - expected.get(result.labelAt(hitIndex))) <= 1e-6f,
+                    "endpoint search returns raw distance, not endpoint value");
+            check(
+                    Float.floatToRawIntBits(rawDistance)
+                                    == Float.floatToRawIntBits(rawDistances[hitIndex])
+                            && Float.floatToRawIntBits(rawDistance)
+                                    == Float.floatToRawIntBits(
+                                            queryRawDistances[hitIndex - result.queryStart(queryIndex)]),
+                    "raw accessors retain identical distance bits");
+        }
     }
 
     private static void testNativeValidation() {
@@ -716,7 +889,7 @@ public class VectorIndexRangeSearchTest {
     }
 
     private static VectorRangeSearchParams params(String metric, Float lower, Float upper) {
-        return new VectorRangeSearchParams(new VectorDistanceBand(metric, lower, upper), 2);
+        return new VectorRangeSearchParams(VectorDistanceBand.fromRaw(metric, lower, upper), 2);
     }
 
     private static VectorIndexReader open(byte[] bytes) {
@@ -774,7 +947,7 @@ public class VectorIndexRangeSearchTest {
         check(
                 result.lims()[0] == 0 && result.lims()[count] == result.labels().length,
                 "CSR limits");
-        check(result.labels().length == result.distances().length, "parallel results");
+        check(result.labels().length == result.rawDistances().length, "parallel results");
         for (int queryIndex = 0; queryIndex < count; queryIndex++) {
             check(
                     result.rowsCommitted()[queryIndex] == result.labelsForQuery(queryIndex).length,
@@ -791,7 +964,7 @@ public class VectorIndexRangeSearchTest {
     private static Map<Long, Float> rows(VectorRangeSearchResult result, int queryIndex) {
         Map<Long, Float> rows = new HashMap<Long, Float>();
         long[] labels = result.labelsForQuery(queryIndex);
-        float[] distances = result.distancesForQuery(queryIndex);
+        float[] distances = result.rawDistancesForQuery(queryIndex);
         for (int row = 0; row < labels.length; row++) {
             check(Float.isFinite(distances[row]), "finite raw distance");
             check(rows.put(labels[row], distances[row]) == null, "unique labels");

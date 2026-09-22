@@ -19,6 +19,54 @@ use super::*;
 use paimon_vindex_core::range::{Bound, CutOperator, DistanceBand, DistanceEndpoint};
 
 #[test]
+fn raw_names_preserve_c_abi_layout() {
+    use std::mem::{align_of, offset_of, size_of};
+
+    assert_eq!(size_of::<PaimonVindexRawDistanceBand>(), 20);
+    assert_eq!(align_of::<PaimonVindexRawDistanceBand>(), 4);
+    assert_eq!(offset_of!(PaimonVindexRawDistanceBand, metric), 0);
+    assert_eq!(offset_of!(PaimonVindexRawDistanceBand, raw_lower_kind), 4);
+    assert_eq!(offset_of!(PaimonVindexRawDistanceBand, raw_lower), 8);
+    assert_eq!(offset_of!(PaimonVindexRawDistanceBand, raw_upper_kind), 12);
+    assert_eq!(offset_of!(PaimonVindexRawDistanceBand, raw_upper), 16);
+
+    let word = size_of::<usize>();
+    assert_eq!(size_of::<PaimonVindexRangeSearchResultView>(), 7 * word);
+    assert_eq!(
+        align_of::<PaimonVindexRangeSearchResultView>(),
+        align_of::<usize>()
+    );
+    assert_eq!(
+        offset_of!(PaimonVindexRangeSearchResultView, query_count),
+        0
+    );
+    assert_eq!(
+        offset_of!(PaimonVindexRangeSearchResultView, hit_count),
+        word
+    );
+    assert_eq!(
+        offset_of!(PaimonVindexRangeSearchResultView, lims),
+        2 * word
+    );
+    assert_eq!(
+        offset_of!(PaimonVindexRangeSearchResultView, labels),
+        3 * word
+    );
+    assert_eq!(
+        offset_of!(PaimonVindexRangeSearchResultView, raw_distances),
+        4 * word
+    );
+    assert_eq!(
+        offset_of!(PaimonVindexRangeSearchResultView, stats),
+        5 * word
+    );
+    assert_eq!(
+        offset_of!(PaimonVindexRangeSearchResultView, list_reads),
+        6 * word
+    );
+}
+
+#[test]
 fn range_endpoints_match_core_for_every_metric_and_operator() {
     for (metric_code, metric) in [
         (PAIMON_VINDEX_METRIC_L2, MetricType::L2),
@@ -74,8 +122,16 @@ fn range_endpoints_match_core_for_every_metric_and_operator() {
                     let actual = unsafe { actual.assume_init() };
                     assert_eq!(actual.metric, metric_code);
                     for (kind, value, expected) in [
-                        (actual.lower_kind, actual.lower, expected.lower()),
-                        (actual.upper_kind, actual.upper, expected.upper()),
+                        (
+                            actual.raw_lower_kind,
+                            actual.raw_lower,
+                            expected.raw_lower(),
+                        ),
+                        (
+                            actual.raw_upper_kind,
+                            actual.raw_upper,
+                            expected.raw_upper(),
+                        ),
                     ] {
                         match expected {
                             Bound::Unbounded => assert_eq!(kind, PAIMON_VINDEX_BOUND_UNBOUNDED),
@@ -94,12 +150,12 @@ fn range_endpoints_match_core_for_every_metric_and_operator() {
 #[test]
 fn range_errors_leave_no_owned_result() {
     let params = PaimonVindexRangeSearchParams {
-        band: PaimonVindexDistanceBand {
+        band: PaimonVindexRawDistanceBand {
             metric: 0,
-            lower_kind: 0,
-            lower: 0.0,
-            upper_kind: 0,
-            upper: 0.0,
+            raw_lower_kind: 0,
+            raw_lower: 0.0,
+            raw_upper_kind: 0,
+            raw_upper: 0.0,
         },
         nprobe: 1,
     };
@@ -193,12 +249,12 @@ unsafe extern "C" fn range_read(
 
 fn unbounded_params() -> PaimonVindexRangeSearchParams {
     PaimonVindexRangeSearchParams {
-        band: PaimonVindexDistanceBand {
+        band: PaimonVindexRawDistanceBand {
             metric: 0,
-            lower_kind: 0,
-            lower: f32::NAN,
-            upper_kind: 0,
-            upper: f32::NAN,
+            raw_lower_kind: 0,
+            raw_lower: f32::NAN,
+            raw_upper_kind: 0,
+            raw_upper: f32::NAN,
         },
         nprobe: 1,
     }
@@ -235,7 +291,7 @@ fn range_result_outlives_reader_and_preserves_signed_labels_and_statistics() {
             &queries,
             2,
             paimon_vindex_core::range::VectorRangeSearchParams::new(
-                DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
+                DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
                 1,
             ),
         )
@@ -258,8 +314,8 @@ fn range_result_outlives_reader_and_preserves_signed_labels_and_statistics() {
         expected.labels()
     );
     assert_eq!(
-        unsafe { slice::from_raw_parts(view.distances, view.hit_count) },
-        expected.distances()
+        unsafe { slice::from_raw_parts(view.raw_distances, view.hit_count) },
+        expected.raw_distances()
     );
     assert_eq!(view.list_reads, expected.call_stats().list_reads());
     for (query, actual) in unsafe { slice::from_raw_parts(view.stats, 2) }
@@ -363,7 +419,7 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
     }
     params = unbounded_params();
     for kind in [2, u32::MAX] {
-        params.band.lower_kind = kind;
+        params.band.raw_lower_kind = kind;
         assert_eq!(
             unsafe {
                 paimon_vindex_reader_range_search(
@@ -378,9 +434,9 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
         );
     }
     params = unbounded_params();
-    params.band.lower_kind = PAIMON_VINDEX_BOUND_FINITE;
+    params.band.raw_lower_kind = PAIMON_VINDEX_BOUND_FINITE;
     for value in [f32::NAN, f32::INFINITY, -1.0] {
-        params.band.lower = value;
+        params.band.raw_lower = value;
         assert_eq!(
             unsafe {
                 paimon_vindex_reader_range_search(

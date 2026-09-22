@@ -25,6 +25,7 @@ import sys
 import threading
 import textwrap
 from collections import Counter
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +49,7 @@ def test_range_public_api_is_exported_without_loading_native_library():
         "DistanceEndpoint",
         "DistanceEndpointOp",
         "RangeSearchParams",
+        "RangeSearchQueryResult",
         "RangeSearchResult",
         "RangeSearchStats",
     } <= set(exports)
@@ -121,6 +123,144 @@ def flat_index(vindex):
     return make_index(vindex)
 
 
+def test_raw_distance_api_names(vindex):
+    assert set(vindex.RangeSearchResult.__dataclass_fields__) == {
+        "lims", "labels", "raw_distances", "stats", "list_reads",
+    }
+    assert set(vindex.DistanceBand.__dataclass_fields__) == {
+        "metric", "raw_lower", "raw_upper",
+    }
+    ffi = vindex._ffi
+    assert not hasattr(ffi, "PaimonVindexDistanceBand")
+    assert ffi.PaimonVindexRawDistanceBand._fields_ == [
+        ("metric", ctypes.c_uint32),
+        ("raw_lower_kind", ctypes.c_uint32),
+        ("raw_lower", ctypes.c_float),
+        ("raw_upper_kind", ctypes.c_uint32),
+        ("raw_upper", ctypes.c_float),
+    ]
+    assert ctypes.sizeof(ffi.PaimonVindexRawDistanceBand) == 20
+    assert [
+        getattr(ffi.PaimonVindexRawDistanceBand, name).offset
+        for name, _ in ffi.PaimonVindexRawDistanceBand._fields_
+    ] == [0, 4, 8, 12, 16]
+    assert ffi.PaimonVindexRangeSearchParams._fields_[0] == (
+        "band", ffi.PaimonVindexRawDistanceBand
+    )
+    assert [name for name, _ in ffi.PaimonVindexRangeSearchResultView._fields_] == [
+        "query_count", "hit_count", "lims", "labels", "raw_distances", "stats",
+        "list_reads",
+    ]
+
+
+@pytest.mark.parametrize("args,kwargs", [
+    (("l2",), {}),
+    (("l2", 0.0, 4.0), {}),
+    ((), {"metric": "l2", "lower": 0.0, "upper": 4.0}),
+    ((), {"metric": "l2", "raw_lower": 0.0, "raw_upper": 4.0}),
+])
+def test_ambiguous_band_construction_is_rejected(vindex, args, kwargs):
+    with pytest.raises(TypeError, match="from_endpoints.*from_raw"):
+        vindex.DistanceBand(*args, **kwargs)
+
+
+def test_explicit_raw_band_factory(vindex):
+    band = vindex.DistanceBand.from_raw("inner_product", raw_lower=-6, raw_upper="2")
+    assert band.metric == "inner_product"
+    assert band.raw_lower == -6.0 and type(band.raw_lower) is float
+    assert band.raw_upper == 2.0 and type(band.raw_upper) is float
+    assert not hasattr(band, "lower") and not hasattr(band, "upper")
+    assert band == vindex.DistanceBand.from_raw("inner_product", -6.0, 2.0)
+    assert band.to_ffi().raw_lower == -6.0
+    assert band.to_ffi().raw_upper == 2.0
+    unbounded = vindex.DistanceBand.from_raw("l2")
+    assert unbounded.raw_lower is None and unbounded.raw_upper is None
+    assert unbounded.to_ffi().raw_lower_kind == 0
+    assert unbounded.to_ffi().raw_upper_kind == 0
+    with pytest.raises(FrozenInstanceError):
+        band.raw_lower = 0.0
+    with pytest.raises(TypeError):
+        vindex.DistanceBand.from_raw("l2", lower=0.0, upper=4.0)
+    with pytest.raises(ValueError):
+        vindex.DistanceBand.from_raw("l2", raw_lower="invalid")
+
+
+@pytest.fixture(scope="module", params=["l2", "inner_product", "cosine"])
+def endpoint_index(request, vindex):
+    metric = request.param
+    data = np.zeros((128, 16), dtype=np.float32)
+    query = np.zeros(16, dtype=np.float32)
+    if metric == "l2":
+        data[:, 0] = 5.0
+        data[0, 0], data[1, 0] = 3.0, 4.0
+        endpoints = {"upper": vindex.DistanceEndpoint(4.0, vindex.DistanceEndpointOp.LE)}
+        expected = [9.0, 16.0]
+    elif metric == "inner_product":
+        query[0] = 2.0
+        data[:, 0] = 2.0
+        data[0, 0], data[1, 0] = 3.0, 2.5
+        endpoints = {"lower": vindex.DistanceEndpoint(5.0, vindex.DistanceEndpointOp.GE)}
+        expected = [-6.0, -5.0]
+    else:
+        query[0] = 1.0
+        data[:, 1] = 1.0
+        data[0, 0] = 1.0
+        data[1] = query
+        endpoints = {"upper": vindex.DistanceEndpoint(0.5, vindex.DistanceEndpointOp.LE)}
+        expected = [1.0 - 1.0 / np.sqrt(2.0), 0.0]
+    labels = np.arange(len(data), dtype=np.int64) + (1 << 40)
+    options = {
+        "index.type": "ivf_flat", "dimension": "16", "metric": metric,
+        "nlist": "1",
+    }
+    output = io.BytesIO()
+    training = vindex.VectorIndexTrainer.train(options, data)
+    with vindex.VectorIndexWriter(training) as writer:
+        writer.add_vectors(labels, data)
+        writer.write(output)
+    return metric, output.getvalue(), query, labels, endpoints, expected
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("filter_kind", ["none", "subset", "empty"])
+def test_endpoint_search_returns_raw_distances(vindex, endpoint_index, batch, filter_kind):
+    metric, payload, query, labels, endpoints, expected = endpoint_index
+    band = vindex.DistanceBand.from_endpoints(metric, **endpoints)
+    params = vindex.RangeSearchParams(band, 1)
+    allowed = {"none": labels, "subset": labels[::3], "empty": labels[:0]}[filter_kind]
+    filter_bytes = None if filter_kind == "none" else roaring_allowlist(allowed)
+    with vindex.VectorIndexReader(BytesInput(payload)) as reader:
+        method = reader.range_search_batch if batch else reader.range_search
+        result = method(
+            np.stack([query, query]) if batch else query, params,
+            roaring_filter=filter_bytes,
+        )
+    assert not hasattr(result, "distances")
+    assert result.raw_distances.dtype == np.dtype(np.float32)
+    assert result.raw_distances.flags.owndata and result.raw_distances.flags.writeable
+    assert result.query_count == (2 if batch else 1)
+    expected_hits = {
+        label: raw_distance
+        for label, raw_distance in zip(labels[:2], expected)
+        if label in allowed
+    }
+    for query_index in range(result.query_count):
+        hits = result.query(query_index)
+        assert isinstance(hits, tuple)
+        assert hits._fields == ("labels", "raw_distances")
+        assert not hasattr(hits, "distances")
+        hit_labels, raw_distances = hits
+        assert hit_labels is hits.labels and raw_distances is hits.raw_distances
+        assert hit_labels.base is result.labels
+        assert raw_distances.base is result.raw_distances
+        assert set(hit_labels) == set(expected_hits)
+        for label, raw_distance in zip(hit_labels, raw_distances):
+            assert raw_distance == pytest.approx(expected_hits[label], abs=1e-6)
+        if expected_hits:
+            assert np.shares_memory(hit_labels, result.labels)
+            assert np.shares_memory(raw_distances, result.raw_distances)
+
+
 @pytest.mark.parametrize("batch", [False, True])
 def test_range_accepts_unaligned_contiguous_queries(vindex, flat_index, batch):
     payload, data, _ = flat_index
@@ -131,7 +271,7 @@ def test_range_accepts_unaligned_contiguous_queries(vindex, flat_index, batch):
     )
     queries[:] = source
     assert queries.flags.c_contiguous and not queries.flags.aligned
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
         method = reader.range_search_batch if batch else reader.range_search
         result = method(queries, params)
@@ -180,7 +320,7 @@ def test_older_native_library_preserves_import_and_topk(missing):
             expected = reader.search(data[0], params)
             assert expected[0][0] == labels[0]
             assert not reader.supports_range_search()
-            range_params = api.RangeSearchParams(api.DistanceBand("l2"), 4)
+            range_params = api.RangeSearchParams(api.DistanceBand.from_raw("l2"), 4)
             for call in (
                 lambda: reader.range_search(data[0], range_params),
                 lambda: reader.range_search_batch(data[:3], range_params),
@@ -208,16 +348,16 @@ def test_range_matrix(vindex, index_case, batch, filter_kind, band_kind):
     index_type, metric, (payload, data, labels) = index_case
     queries = data[:3] if batch else data[:1]
     if band_kind == "unbounded":
-        band = vindex.DistanceBand(metric)
+        band = vindex.DistanceBand.from_raw(metric)
     elif band_kind == "empty":
-        band = vindex.DistanceBand(metric, 0.0, 0.0)
+        band = vindex.DistanceBand.from_raw(metric, 0.0, 0.0)
     else:
         lower, upper = {
             "l2": (0.0, 24.0),
             "inner_product": (-4.0, 2.0),
             "cosine": (0.0, 0.95),
         }[metric]
-        band = vindex.DistanceBand(metric, lower, upper)
+        band = vindex.DistanceBand.from_raw(metric, lower, upper)
     allowed = {
         "none": labels,
         "subset": labels[::3],
@@ -232,15 +372,15 @@ def test_range_matrix(vindex, index_case, batch, filter_kind, band_kind):
             queries if batch else queries[0], params, roaring_filter=filter_bytes
         )
     assert result.query_count == len(queries)
-    assert result.hit_count == len(result.labels) == len(result.distances)
+    assert result.hit_count == len(result.labels) == len(result.raw_distances)
     assert result.lims.dtype == np.dtype(np.uintp)
     assert result.labels.dtype == np.dtype(np.int64)
-    assert result.distances.dtype == np.dtype(np.float32)
+    assert result.raw_distances.dtype == np.dtype(np.float32)
     assert result.lims[0] == 0 and result.lims[-1] == result.hit_count
     assert np.all(result.lims[1:] >= result.lims[:-1])
     assert len(result.stats) == len(queries)
     assert 0 <= result.list_reads <= 4
-    for array in (result.lims, result.labels, result.distances):
+    for array in (result.lims, result.labels, result.raw_distances):
         assert array.flags.owndata
     for query_index, query in enumerate(queries):
         with vindex.VectorIndexReader(BytesInput(payload)) as reader:
@@ -253,7 +393,7 @@ def test_range_matrix(vindex, index_case, batch, filter_kind, band_kind):
         )
         np.testing.assert_array_equal(
             actual_distances[actual_order].view(np.uint32),
-            reference.distances[reference_order].view(np.uint32),
+            reference.raw_distances[reference_order].view(np.uint32),
         )
         assert set(actual_labels) <= set(allowed)
         assert result.stats[query_index] == reference.stats[0]
@@ -267,17 +407,17 @@ def test_range_matrix(vindex, index_case, batch, filter_kind, band_kind):
             assert set(actual_labels) == set(allowed)
         if band_kind == "empty" or filter_kind == "empty":
             assert len(actual_labels) == 0
-        if band.lower is not None:
-            assert np.all(actual_distances >= np.float32(band.lower))
-        if band.upper is not None:
-            assert np.all(actual_distances < np.float32(band.upper))
+        if band.raw_lower is not None:
+            assert np.all(actual_distances >= np.float32(band.raw_lower))
+        if band.raw_upper is not None:
+            assert np.all(actual_distances < np.float32(band.raw_upper))
 
 
 @pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("filter_bytes", [b"", b"invalid roaring"])
 def test_invalid_filter(vindex, flat_index, batch, filter_bytes):
     payload, data, _ = flat_index
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
         method = reader.range_search_batch if batch else reader.range_search
         with pytest.raises(RuntimeError, match="[Rr]oaring|filter"):
@@ -291,7 +431,7 @@ def test_invalid_filter(vindex, flat_index, batch, filter_bytes):
 ])
 def test_invalid_bands_are_rejected_by_core(vindex, flat_index, lower, upper):
     payload, data, _ = flat_index
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2", lower, upper), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2", lower, upper), 4)
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
         with pytest.raises(RuntimeError):
             reader.range_search(data[0], params)
@@ -302,7 +442,7 @@ def test_invalid_bands_are_rejected_by_core(vindex, flat_index, lower, upper):
 @pytest.mark.parametrize("nprobe", [-1, 0, 1.5, ctypes.c_size_t(-1).value + 1])
 def test_nprobe_rejects_invalid_and_wrapping_values(vindex, nprobe):
     with pytest.raises(ValueError, match="nprobe"):
-        vindex.RangeSearchParams(vindex.DistanceBand("l2"), nprobe)
+        vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), nprobe)
 
 
 @pytest.mark.parametrize("metric", ["l2", "inner_product", "cosine"])
@@ -315,7 +455,7 @@ def test_endpoints_match_direct_core_conversion(vindex, metric, lower_op, upper_
     band = vindex.DistanceBand.from_endpoints(metric, lower, upper)
     raw_lower = ffi.PaimonVindexDistanceEndpoint(lower.value, lower_op)
     raw_upper = ffi.PaimonVindexDistanceEndpoint(upper.value, upper_op)
-    expected = ffi.PaimonVindexDistanceBand()
+    expected = ffi.PaimonVindexRawDistanceBand()
     assert ffi.lib.paimon_vindex_distance_band_from_endpoints(
         {"l2": 0, "inner_product": 1, "cosine": 2}[metric],
         ctypes.byref(raw_lower), ctypes.byref(raw_upper), ctypes.byref(expected),
@@ -327,7 +467,7 @@ def test_endpoints_match_direct_core_conversion(vindex, metric, lower_op, upper_
 def test_empty_batch_and_query_accessor(vindex, flat_index):
     payload, data, _ = flat_index
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
-        params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+        params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
         with pytest.raises(RuntimeError, match="query count must be greater than 0"):
             reader.range_search_batch(data[:0], params)
         result = reader.range_search(data[0], params)
@@ -342,7 +482,7 @@ def test_empty_batch_and_query_accessor(vindex, flat_index):
 @pytest.mark.parametrize("filter_kind", ["none", "subset", "empty"])
 def test_query_access_shares_owned_payload(vindex, flat_index, batch, filter_kind):
     payload, data, labels = flat_index
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     filter_bytes = {
         "none": None,
         "subset": roaring_allowlist(labels[::3]),
@@ -356,10 +496,13 @@ def test_query_access_shares_owned_payload(vindex, flat_index, batch, filter_kin
     retained_views = []
     for query_index in range(result.query_count):
         start, end = int(result.lims[query_index]), int(result.lims[query_index + 1])
+        hits = result.query(query_index)
+        repeated_hits = result.query(query_index)
+        assert hits._fields == ("labels", "raw_distances")
         for owned, view, repeated in zip(
-            (result.labels, result.distances),
-            result.query(query_index),
-            result.query(query_index),
+            (result.labels, result.raw_distances),
+            hits,
+            repeated_hits,
         ):
             assert view.base is owned and repeated.base is owned
             assert view.flags.writeable and repeated.flags.writeable
@@ -371,7 +514,7 @@ def test_query_access_shares_owned_payload(vindex, flat_index, batch, filter_kin
                 owned[end - 1] = -2
                 assert view[-1] == repeated[-1] == -2
             retained_views.append(view)
-    del result, owned, view, repeated
+    del result, hits, repeated_hits, owned, view, repeated
     for view in retained_views:
         if len(view):
             assert view[-1] == -2
@@ -385,7 +528,7 @@ def test_query_access_shares_owned_payload(vindex, flat_index, batch, filter_kin
 ])
 def test_query_shapes(vindex, flat_index, batch, shape, error):
     payload, _, _ = flat_index
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
         method = reader.range_search_batch if batch else reader.range_search
         with pytest.raises(error):
@@ -395,7 +538,7 @@ def test_query_shapes(vindex, flat_index, batch, shape, error):
 def test_strided_queries_and_filter_buffer_types(vindex, flat_index):
     payload, data, labels = flat_index
     queries = np.asfortranarray(data[:4].astype(np.float64))[::2]
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     serialized = roaring_allowlist(labels[::3])
     for filter_bytes in (bytearray(serialized), memoryview(serialized)):
         with vindex.VectorIndexReader(BytesInput(payload)) as reader:
@@ -409,7 +552,7 @@ def test_strided_queries_and_filter_buffer_types(vindex, flat_index):
 
 def test_query_buffer_overflow_before_copy(vindex, flat_index):
     payload, _, _ = flat_index
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     huge = np.lib.stride_tricks.as_strided(
         np.zeros(1, dtype=np.uint8),
         shape=(np.iinfo(np.intp).max // 32, 16), strides=(0, 0),
@@ -423,7 +566,7 @@ def test_query_buffer_overflow_before_copy(vindex, flat_index):
 def test_closed_reader_and_reentry(vindex, flat_index, operation):
     payload, data, _ = flat_index
     reader = vindex.VectorIndexReader(BytesInput(payload))
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     invoke = {
         "single": lambda: reader.range_search(data[0], params),
         "batch": lambda: reader.range_search_batch(data[:2], params),
@@ -441,7 +584,7 @@ def test_diskann_is_unsupported(vindex):
     payload, data, _ = make_index(vindex, "diskann")
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
         assert reader.supports_range_search() is False
-        params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+        params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
         for query in (data[0], data[:2]):
             method = (
                 reader.range_search if query.ndim == 1 else reader.range_search_batch
@@ -455,15 +598,15 @@ def test_diskann_is_unsupported(vindex):
 @pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("filtered", [False, True])
 @pytest.mark.parametrize("failure", [
-    "view", "copy_lims", "copy_labels", "copy_distances", "stats", "result",
-    "search", "null", "null_distances",
+    "view", "copy_lims", "copy_labels", "copy_raw_distances", "stats", "result",
+    "search", "null", "null_raw_distances",
     "null_stats", "null_lims", "length", "overflow", "lims",
 ])
 def test_result_destroyed_on_failure(
     vindex, flat_index, monkeypatch, failure, batch, filtered
 ):
     payload, data, labels = flat_index
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     ffi = vindex._ffi
     destroyed = []
     destroy = ffi.lib.paimon_vindex_range_search_result_destroy
@@ -476,7 +619,7 @@ def test_result_destroyed_on_failure(
     search = getattr(ffi.lib, search_name)
     as_array = np.ctypeslib.as_array
     array_count = 0
-    copy_failure_at = {"copy_lims": 1, "copy_labels": 2, "copy_distances": 3}.get(
+    copy_failure_at = {"copy_lims": 1, "copy_labels": 2, "copy_raw_distances": 3}.get(
         failure
     )
 
@@ -493,8 +636,8 @@ def test_result_destroyed_on_failure(
             return -1
         if failure == "null":
             raw.labels = ctypes.POINTER(ctypes.c_int64)()
-        if failure == "null_distances":
-            raw.distances = ctypes.POINTER(ctypes.c_float)()
+        if failure == "null_raw_distances":
+            raw.raw_distances = ctypes.POINTER(ctypes.c_float)()
         if failure == "null_stats":
             raw.stats = ctypes.POINTER(ffi.PaimonVindexRangeSearchStats)()
         if failure == "null_lims":
@@ -547,7 +690,7 @@ def test_result_destroyed_on_failure(
 
 def test_result_copies_survive_native_destruction(vindex, flat_index, monkeypatch):
     payload, data, _ = flat_index
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     ffi = vindex._ffi
     destroy = ffi.lib.paimon_vindex_range_search_result_destroy
     destroyed = []
@@ -562,7 +705,7 @@ def test_result_copies_survive_native_destruction(vindex, flat_index, monkeypatc
         )
         ctypes.memset(view.labels, 255, view.hit_count * ctypes.sizeof(ctypes.c_int64))
         ctypes.memset(
-            view.distances, 255, view.hit_count * ctypes.sizeof(ctypes.c_float)
+            view.raw_distances, 255, view.hit_count * ctypes.sizeof(ctypes.c_float)
         )
         ctypes.memset(
             view.stats, 255,
@@ -579,7 +722,7 @@ def test_result_copies_survive_native_destruction(vindex, flat_index, monkeypatc
     assert len(destroyed) == 1
     np.testing.assert_array_equal(result.lims, [0, 128, 256])
     assert np.all(result.labels >= (1 << 40))
-    assert np.all(np.isfinite(result.distances))
+    assert np.all(np.isfinite(result.raw_distances))
     assert [stats.rows_committed for stats in result.stats] == [128, 128]
 
 
@@ -610,7 +753,7 @@ def test_endpoint_operator_cannot_wrap(vindex, op):
 
 def test_nullable_and_extreme_endpoints(vindex):
     for metric in ("l2", "inner_product", "cosine"):
-        assert vindex.DistanceBand.from_endpoints(metric) == vindex.DistanceBand(metric)
+        assert vindex.DistanceBand.from_endpoints(metric) == vindex.DistanceBand.from_raw(metric)
         assert vindex.DistanceBand.from_endpoints(
             metric, lower=vindex.DistanceEndpoint(0.1, vindex.DistanceEndpointOp.GE)
         ).metric == metric
@@ -628,7 +771,7 @@ def test_nullable_and_extreme_endpoints(vindex):
 def test_metric_and_parameter_validation(vindex, flat_index):
     for metric in ("unknown", -1, 1 << 32, None):
         with pytest.raises(ValueError, match="metric"):
-            vindex.DistanceBand(metric)
+            vindex.DistanceBand.from_raw(metric)
     with pytest.raises(TypeError, match="band"):
         vindex.RangeSearchParams("l2", 4)
     payload, data, _ = flat_index
@@ -637,18 +780,18 @@ def test_metric_and_parameter_validation(vindex, flat_index):
             reader.range_search(data[0], vindex.SearchParams.ivf(4, 4))
         with pytest.raises(RuntimeError, match="metric"):
             reader.range_search(
-                data[0], vindex.RangeSearchParams(vindex.DistanceBand("cosine"), 4)
+                data[0], vindex.RangeSearchParams(vindex.DistanceBand.from_raw("cosine"), 4)
             )
         with pytest.raises(ValueError, match="bytes"):
             reader.range_search(
-                data[0], vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4),
+                data[0], vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4),
                 roaring_filter="not bytes",
             )
 
 
 def test_range_callback_reentry(vindex, flat_index):
     payload, data, _ = flat_index
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
 
     class ReentrantInput(BytesInput):
         operation = None
@@ -681,7 +824,7 @@ def test_range_callback_reentry(vindex, flat_index):
 def test_range_close_waits_through_result_copy(vindex, flat_index, monkeypatch):
     payload, data, _ = flat_index
     reader = vindex.VectorIndexReader(BytesInput(payload))
-    params = vindex.RangeSearchParams(vindex.DistanceBand("l2"), 4)
+    params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
     copy_entered = threading.Event()
     release_copy = threading.Event()
     close_entered = threading.Event()
@@ -770,7 +913,7 @@ def test_core_oracle(vindex, directory, case_name, index_filename):
     upper = (
         struct.unpack("<f", struct.pack("<I", upper_bits))[0] if upper_kind else None
     )
-    band = vindex.DistanceBand(
+    band = vindex.DistanceBand.from_raw(
         {0: "l2", 1: "inner_product", 2: "cosine"}[metric], lower, upper
     )
     source = BytesInput((directory / index_filename).read_bytes())

@@ -27,16 +27,18 @@ pub const PAIMON_VINDEX_CUT_GT: u32 = 1;
 pub const PAIMON_VINDEX_CUT_LE: u32 = 2;
 pub const PAIMON_VINDEX_CUT_LT: u32 = 3;
 
-/// Internal half-open distance band: squared L2, 1-cosine, or negative inner product.
-/// Unbounded sides ignore their value field; finite sides must be finite.
+/// Explicitly raw half-open distance band: squared L2, 1-cosine, or negative
+/// inner product. Prefer paimon_vindex_distance_band_from_endpoints for public
+/// predicates. Raw cuts are not the original endpoints; inner product reverses
+/// their sides. Unbounded sides ignore their value; finite sides must be finite.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct PaimonVindexDistanceBand {
+pub struct PaimonVindexRawDistanceBand {
     pub metric: u32,
-    pub lower_kind: u32,
-    pub lower: f32,
-    pub upper_kind: u32,
-    pub upper: f32,
+    pub raw_lower_kind: u32,
+    pub raw_lower: f32,
+    pub raw_upper_kind: u32,
+    pub raw_upper: f32,
 }
 
 /// Public-distance predicate endpoint. Values are passed to core without rounding.
@@ -52,7 +54,7 @@ pub struct PaimonVindexDistanceEndpoint {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PaimonVindexRangeSearchParams {
-    pub band: PaimonVindexDistanceBand,
+    pub band: PaimonVindexRawDistanceBand,
     pub nprobe: usize,
 }
 
@@ -66,15 +68,17 @@ pub struct PaimonVindexRangeSearchStats {
 }
 
 /// Borrowed CSR view; all pointers remain valid until the owning result is destroyed.
-/// lims has query_count + 1 entries; labels/distances have hit_count entries;
+/// lims has query_count + 1 entries; labels/raw_distances have hit_count entries;
 /// stats has query_count entries. Empty arrays must not be dereferenced.
+/// raw_distances retain squared-L2, cosine-distance, or negative-inner-product
+/// units; they cannot be compared directly with public L2 or IP endpoints.
 #[repr(C)]
 pub struct PaimonVindexRangeSearchResultView {
     pub query_count: usize,
     pub hit_count: usize,
     pub lims: *const usize,
     pub labels: *const i64,
-    pub distances: *const f32,
+    pub raw_distances: *const f32,
     pub stats: *const PaimonVindexRangeSearchStats,
     pub list_reads: usize,
 }
@@ -103,9 +107,9 @@ fn range_bound(kind: u32, value: f32) -> Result<Bound, String> {
 }
 
 fn range_params(params: PaimonVindexRangeSearchParams) -> Result<VectorRangeSearchParams, String> {
-    let band = DistanceBand::new(
-        range_bound(params.band.lower_kind, params.band.lower)?,
-        range_bound(params.band.upper_kind, params.band.upper)?,
+    let band = DistanceBand::from_raw(
+        range_bound(params.band.raw_lower_kind, params.band.raw_lower)?,
+        range_bound(params.band.raw_upper_kind, params.band.raw_upper)?,
         range_metric(params.band.metric)?,
     )
     .map_err(|error| format!("range band: {error}"))?;
@@ -132,19 +136,19 @@ unsafe fn range_endpoint(
     }))
 }
 
-fn range_band_to_ffi(band: DistanceBand) -> PaimonVindexDistanceBand {
+fn range_band_to_ffi(band: DistanceBand) -> PaimonVindexRawDistanceBand {
     let encode = |bound| match bound {
         Bound::Unbounded => (PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0),
         Bound::Finite(value) => (PAIMON_VINDEX_BOUND_FINITE, value),
     };
-    let (lower_kind, lower) = encode(band.lower());
-    let (upper_kind, upper) = encode(band.upper());
-    PaimonVindexDistanceBand {
+    let (raw_lower_kind, raw_lower) = encode(band.raw_lower());
+    let (raw_upper_kind, raw_upper) = encode(band.raw_upper());
+    PaimonVindexRawDistanceBand {
         metric: metric_code(band.metric()),
-        lower_kind,
-        lower,
-        upper_kind,
-        upper,
+        raw_lower_kind,
+        raw_lower,
+        raw_upper_kind,
+        raw_upper,
     }
 }
 
@@ -156,7 +160,7 @@ pub unsafe extern "C" fn paimon_vindex_distance_band_from_endpoints(
     metric: u32,
     lower: *const PaimonVindexDistanceEndpoint,
     upper: *const PaimonVindexDistanceEndpoint,
-    out: *mut PaimonVindexDistanceBand,
+    out: *mut PaimonVindexRawDistanceBand,
 ) -> c_int {
     ffi_status(|| {
         if out.is_null() {
@@ -390,7 +394,7 @@ pub unsafe extern "C" fn paimon_vindex_range_search_result_view(
                 hit_count: result.inner.labels().len(),
                 lims: result.inner.lims().as_ptr(),
                 labels: result.inner.labels().as_ptr(),
-                distances: result.inner.distances().as_ptr(),
+                raw_distances: result.inner.raw_distances().as_ptr(),
                 stats: result.stats.as_ptr(),
                 list_reads: result.inner.call_stats().list_reads(),
             }

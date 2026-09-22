@@ -37,29 +37,41 @@ from paimon_vindex import (
 )
 
 band = DistanceBand.from_endpoints(
-    "l2", upper=DistanceEndpoint(2.0, DistanceEndpointOp.LE)
+    "l2", upper=DistanceEndpoint(4.0, DistanceEndpointOp.LE)
 )
 result = reader.range_search_batch(queries, RangeSearchParams(band, nprobe=8))
-labels, distances = result.query(0)
+query_result = result.query(0)
+labels = query_result.labels
+raw_distances = query_result.raw_distances
 stats = result.stats[0]
 ```
 
 ## Distance contracts
 
-- `DistanceBand(metric, lower=None, upper=None)` describes a half-open
-  **internal-distance** interval `[lower, upper)`. Metric names are `l2`,
-  `inner_product`, and `cosine`. Internal distances are squared L2, negative inner
-  product, and cosine distance, respectively.
-- `None` means structurally unbounded, not a finite sentinel. Equal finite cuts
-  describe a valid empty band. Core validates finite, ordered, metric-compatible
-  cuts during search; invalid bands raise `RuntimeError`.
-- `DistanceBand.from_endpoints` accepts optional `DistanceEndpoint(value, op)`
+- Use `DistanceBand.from_endpoints` by default. It accepts optional
+  `DistanceEndpoint(value, op)`
   objects: lower uses `GE`/`GT`, upper uses `LE`/`LT`. Endpoint values are public
   distances (L2 square root, inner product, or cosine distance). Double literals
   pass directly to core, which handles rounding, operator strictness, and inner
   product direction reversal. Python performs no endpoint conversion math.
-- Results retain internal distances. Quantized IVF variants return their own
-  distance estimates, not an additional exact-vector reranking.
+- Advanced callers can use
+  `DistanceBand.from_raw(metric, raw_lower=None, raw_upper=None)` for an explicitly
+  **raw-distance** interval `[raw_lower, raw_upper)`. Metric names are `l2`,
+  `inner_product`, and `cosine`. Raw distances are squared L2, negative inner
+  product, and cosine distance, respectively. Both factories produce immutable
+  bands with fields `metric`, `raw_lower`, and `raw_upper`.
+- `None` means structurally unbounded, not a finite sentinel. Equal finite raw
+  cuts describe a valid empty band. Core validates finite, ordered,
+  metric-compatible raw cuts during search; invalid bands raise `RuntimeError`.
+- Plain `DistanceBand(...)` construction raises `TypeError` directing callers to
+  the factories. There are no ambiguous `lower`/`upper` band fields or legacy
+  result `.distances` aliases.
+- Results expose `raw_distances`, even when the band uses public endpoints.
+  An L2 radius of 4 can return a vector at distance 3 with raw distance **9**;
+  an inner-product lower endpoint `GE 5` can return a product of 6 with raw
+  distance **-6**. Cosine results are cosine distances, not similarities.
+  Quantized IVF variants return their own raw distance estimates, not an
+  additional exact-vector reranking. Top-K return values are unchanged.
 
 ## Queries, filters, and results
 
@@ -74,11 +86,16 @@ empty treemap selects no rows. Empty bytes are not a serialized empty treemap
 and are passed to core for validation.
 
 `RangeSearchResult` contains owned NumPy arrays `lims` (`uintp`), `labels`
-(`int64`), and `distances` (`float32`), plus an immutable tuple `stats` and the
+(`int64`), and `raw_distances` (`float32`), plus an immutable tuple `stats` and the
 call-level `list_reads`. `query_count`, `hit_count`, and `query(index)` expose
-the CSR shape. The query accessor returns label/distance slices and rejects
-negative or out-of-range indices. Arrays and statistics remain valid after
-reader closure and native result destruction.
+the CSR shape. The query accessor returns a `RangeSearchQueryResult` named tuple
+with `labels` and `raw_distances` fields, preserving unpacking as
+`labels, raw_distances = result.query(index)`. It rejects negative or out-of-range
+indices. The result's fields are frozen, but its arrays remain mutable. Query
+slices share those arrays without copying payloads: writes through either view
+are visible in the other. Arrays and statistics remain valid after reader
+closure and native result destruction; query views keep the owned arrays alive
+even after the `RangeSearchResult` itself is released.
 
 Each `RangeSearchStats` contains `lists_probed`, `rows_scanned`,
 `rows_committed`, and `early_abandoned`. These are core's logical counters;

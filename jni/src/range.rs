@@ -140,9 +140,10 @@ fn range_params(env: &mut JNIEnv, params: JObject) -> Result<VectorRangeSearchPa
         .and_then(|value| value.l())
         .map_err(|error| error.to_string())?;
     let metric = read_metric(env, metric)?;
-    let lower = read_bound(env, &band, "lower")?;
-    let upper = read_bound(env, &band, "upper")?;
-    let band = DistanceBand::new(lower, upper, metric).map_err(|error| error.to_string())?;
+    let raw_lower = read_bound(env, &band, "rawLower")?;
+    let raw_upper = read_bound(env, &band, "rawUpper")?;
+    let band =
+        DistanceBand::from_raw(raw_lower, raw_upper, metric).map_err(|error| error.to_string())?;
     Ok(VectorRangeSearchParams::new(band, nprobe))
 }
 
@@ -203,14 +204,14 @@ fn build_range_result(env: &mut JNIEnv, result: RangeSearchResult) -> Result<job
     checked_array_length(result.query_count(), "query count")?;
     checked_array_length(result.lims().len(), "lims")?;
     checked_array_length(result.labels().len(), "labels")?;
-    let distance_count = checked_array_length(result.distances().len(), "distances")?;
+    let raw_distance_count = checked_array_length(result.raw_distances().len(), "rawDistances")?;
     let list_reads = checked_counter(result.call_stats().list_reads(), "listReads")?;
     let labels = long_array(env, result.labels(), "labels")?;
-    let distances = env
-        .new_float_array(distance_count)
+    let raw_distances = env
+        .new_float_array(raw_distance_count)
         .map_err(|error| error.to_string())?;
-    let distances = env.auto_local(distances);
-    env.set_float_array_region(&distances, 0, result.distances())
+    let raw_distances = env.auto_local(raw_distances);
+    env.set_float_array_region(&raw_distances, 0, result.raw_distances())
         .map_err(|error| error.to_string())?;
     let lims = counter_array(env, result.lims().len(), "lims", |index| {
         result.lims()[index]
@@ -233,7 +234,7 @@ fn build_range_result(env: &mut JNIEnv, result: RangeSearchResult) -> Result<job
         "([J[F[J[J[J[J[JJ)Lorg/apache/paimon/index/vector/VectorRangeSearchResult;",
         &[
             JValue::Object(&labels),
-            JValue::Object(&distances),
+            JValue::Object(&raw_distances),
             JValue::Object(&lims),
             JValue::Object(&lists_probed),
             JValue::Object(&rows_scanned),
@@ -293,8 +294,8 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_dis
         let upper = read_endpoint(env, upper, upper_operator)?;
         let band = DistanceBand::from_endpoints(lower, upper, metric)
             .map_err(|error| error.to_string())?;
-        let lower = boxed_bound(env, band.lower())?;
-        let upper = boxed_bound(env, band.upper())?;
+        let raw_lower = boxed_bound(env, band.raw_lower())?;
+        let raw_upper = boxed_bound(env, band.raw_upper())?;
         let metric = env
             .new_string(metric.as_str())
             .map_err(|error| error.to_string())?;
@@ -304,8 +305,8 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_dis
             "(Ljava/lang/String;Ljava/lang/Float;Ljava/lang/Float;)V",
             &[
                 JValue::Object(&metric),
-                JValue::Object(&lower),
-                JValue::Object(&upper),
+                JValue::Object(&raw_lower),
+                JValue::Object(&raw_upper),
             ],
         )
         .map(|object| object.into_raw())

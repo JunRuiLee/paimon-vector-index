@@ -21,13 +21,14 @@ import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * CSR range-search output in core scan order, with raw distances and no sorting or top-K cap.
+ * CSR range-search output in core scan order, with raw distances (squared L2, 1 - cosine, or
+ * negative inner product) and no sorting or top-K cap.
  * IVF-Flat distances are exact; SQ, PQ and RQ return their core distance estimates. Each query
  * occupies [lims[query], lims[query + 1]). Public construction and array-returning accessors make
  * defensive copies; native construction takes exclusive ownership of its arrays.
  *
  * <p>For allocation-free consumption, use {@link #hitCount()}, {@link #labelAt(int)},
- * {@link #distanceAt(int)}, and the half-open bounds {@link #queryStart(int)} and
+ * {@link #rawDistanceAt(int)}, and the half-open bounds {@link #queryStart(int)} and
  * {@link #queryEnd(int)}. Counter accessors taking a query index also avoid copying arrays.
  * Hit indices and query bounds fit in {@code int}, while labels and counters retain their full
  * {@code long} range. Indexed accessors reject out-of-range indices with
@@ -36,7 +37,7 @@ import java.util.Objects;
 public final class VectorRangeSearchResult {
 
     private final long[] labels;
-    private final float[] distances;
+    private final float[] rawDistances;
     private final long[] lims;
     private final long[] listsProbed;
     private final long[] rowsScanned;
@@ -46,7 +47,7 @@ public final class VectorRangeSearchResult {
 
     static VectorRangeSearchResult fromNative(
             long[] labels,
-            float[] distances,
+            float[] rawDistances,
             long[] lims,
             long[] listsProbed,
             long[] rowsScanned,
@@ -55,7 +56,7 @@ public final class VectorRangeSearchResult {
             long listReads) {
         return new VectorRangeSearchResult(
                 labels,
-                distances,
+                rawDistances,
                 lims,
                 listsProbed,
                 rowsScanned,
@@ -67,7 +68,7 @@ public final class VectorRangeSearchResult {
 
     public VectorRangeSearchResult(
             long[] labels,
-            float[] distances,
+            float[] rawDistances,
             long[] lims,
             long[] listsProbed,
             long[] rowsScanned,
@@ -76,7 +77,7 @@ public final class VectorRangeSearchResult {
             long listReads) {
         this(
                 labels,
-                distances,
+                rawDistances,
                 lims,
                 listsProbed,
                 rowsScanned,
@@ -88,7 +89,7 @@ public final class VectorRangeSearchResult {
 
     private VectorRangeSearchResult(
             long[] labels,
-            float[] distances,
+            float[] rawDistances,
             long[] lims,
             long[] listsProbed,
             long[] rowsScanned,
@@ -97,12 +98,12 @@ public final class VectorRangeSearchResult {
             long listReads,
             boolean copyArrays) {
         Objects.requireNonNull(labels, "labels");
-        Objects.requireNonNull(distances, "distances");
+        Objects.requireNonNull(rawDistances, "rawDistances");
         Objects.requireNonNull(lims, "lims");
         this.labels = copyArrays ? labels.clone() : labels;
-        this.distances = copyArrays ? distances.clone() : distances;
+        this.rawDistances = copyArrays ? rawDistances.clone() : rawDistances;
         this.lims = copyArrays ? lims.clone() : lims;
-        if (this.labels.length != this.distances.length
+        if (this.labels.length != this.rawDistances.length
                 || this.lims.length == 0
                 || this.lims[0] != 0
                 || this.lims[this.lims.length - 1] != this.labels.length) {
@@ -150,12 +151,12 @@ public final class VectorRangeSearchResult {
         return labels[hitIndex];
     }
 
-    public float[] distances() {
-        return distances.clone();
+    public float[] rawDistances() {
+        return rawDistances.clone();
     }
 
-    public float distanceAt(int hitIndex) {
-        return distances[hitIndex];
+    public float rawDistanceAt(int hitIndex) {
+        return rawDistances[hitIndex];
     }
 
     public long[] lims() {
@@ -212,10 +213,10 @@ public final class VectorRangeSearchResult {
                 labels, Math.toIntExact(lims[queryIndex]), Math.toIntExact(lims[queryIndex + 1]));
     }
 
-    public float[] distancesForQuery(int queryIndex) {
+    public float[] rawDistancesForQuery(int queryIndex) {
         checkQueryIndex(queryIndex);
         return Arrays.copyOfRange(
-                distances,
+                rawDistances,
                 Math.toIntExact(lims[queryIndex]),
                 Math.toIntExact(lims[queryIndex + 1]));
     }

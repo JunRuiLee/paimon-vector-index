@@ -44,6 +44,13 @@
 
 #include "range_test_support.h"
 
+_Static_assert(_Generic(((PaimonVindexRangeSearchParams *)0)->band,
+                       PaimonVindexRawDistanceBand: 1, default: 0),
+               "range parameters must use an explicitly raw band");
+_Static_assert(_Generic(((PaimonVindexRangeSearchResultView *)0)->raw_distances,
+                       const float *: 1, default: 0),
+               "range results must expose borrowed raw distances");
+
 struct MemBuffer {
     uint8_t *data;
     size_t len;
@@ -602,42 +609,105 @@ static void consume_range_fixture(const struct RangeFixture *fixture) {
     paimon_vindex_range_search_result_destroy(result);
 }
 
+static void test_range_endpoint_raw_results(void) {
+    const char *metrics[] = {"l2", "inner_product"};
+    const uint32_t metric_codes[] = {PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_METRIC_INNER_PRODUCT};
+    const float coordinates[][3] = {{3.0f, 4.0f, 5.0f}, {3.0f, 2.5f, 2.0f}};
+    const float expected_raw_distances[][2] = {{9.0f, 16.0f}, {-6.0f, -5.0f}};
+    const int64_t labels[] = {INT64_C(1) << 40, (INT64_C(1) << 40) + 1, (INT64_C(1) << 40) + 2};
+    for (size_t metric_index = 0; metric_index < 2; ++metric_index) {
+        float data[3 * RANGE_DIMENSION] = {0};
+        float query[RANGE_DIMENSION] = {0};
+        for (size_t row = 0; row < 3; ++row) {
+            data[row * RANGE_DIMENSION] = coordinates[metric_index][row];
+        }
+        if (metric_codes[metric_index] == PAIMON_VINDEX_METRIC_INNER_PRODUCT) query[0] = 2.0f;
+        const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
+        const char *values[] = {"ivf_flat", "8", "1", metrics[metric_index]};
+        PaimonVindexTrainerHandle *trainer = paimon_vindex_trainer_open(keys, values, 4);
+        ASSERT_TRUE(trainer != NULL);
+        ASSERT_TRUE(paimon_vindex_trainer_add_training_vectors(trainer, data, 3) == 0);
+        PaimonVindexTrainingHandle *training = paimon_vindex_trainer_finish(trainer);
+        ASSERT_TRUE(training != NULL);
+        paimon_vindex_trainer_free(trainer);
+        PaimonVindexWriterHandle *writer = paimon_vindex_writer_open(training);
+        ASSERT_TRUE(writer != NULL);
+        paimon_vindex_training_free(training);
+        ASSERT_TRUE(paimon_vindex_writer_add_vectors(writer, labels, data, 3) == 0);
+        struct MemBuffer buffer = {0};
+        PaimonVindexOutputFile output = {
+            .ctx = &buffer, .write_fn = mem_write, .flush_fn = mem_flush, .get_pos_fn = mem_pos};
+        ASSERT_TRUE(paimon_vindex_writer_write_index(writer, output) == 0);
+        paimon_vindex_writer_free(writer);
+        PaimonVindexInputFile input = {.ctx = &buffer, .read_ranges_fn = mem_read_ranges};
+        PaimonVindexReaderHandle *reader = paimon_vindex_reader_open(input);
+        ASSERT_TRUE(reader != NULL);
+        PaimonVindexRangeSearchParams params = range_all_params(metric_codes[metric_index]);
+        params.nprobe = 1;
+        PaimonVindexDistanceEndpoint radius = {4.0, PAIMON_VINDEX_CUT_LE};
+        PaimonVindexDistanceEndpoint similarity = {5.0, PAIMON_VINDEX_CUT_GE};
+        ASSERT_TRUE(paimon_vindex_distance_band_from_endpoints(
+            metric_codes[metric_index], metric_index == 0 ? NULL : &similarity,
+            metric_index == 0 ? &radius : NULL, &params.band) == 0);
+        PaimonVindexRangeSearchResult *result = NULL;
+        ASSERT_TRUE(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, params, &result) == 0);
+        paimon_vindex_reader_free(reader);
+        free(buffer.data);
+        PaimonVindexRangeSearchResultView view = range_view(result);
+        range_assert_shape(&view);
+        ASSERT_TRUE(view.query_count == 1 && view.hit_count == 2);
+        for (size_t expected = 0; expected < 2; ++expected) {
+            size_t matches = 0;
+            for (size_t hit = 0; hit < view.hit_count; ++hit) {
+                if (view.labels[hit] == labels[expected]) {
+                    ASSERT_TRUE(range_float_bits(view.raw_distances[hit]) ==
+                                range_float_bits(expected_raw_distances[metric_index][expected]));
+                    ++matches;
+                }
+            }
+            ASSERT_TRUE(matches == 1);
+        }
+        paimon_vindex_range_search_result_destroy(result);
+        printf("PASS range_endpoint_raw_results %s\n", metrics[metric_index]);
+    }
+}
+
 static void test_range_endpoints(void) {
     const uint32_t metrics[] = {
         PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_METRIC_COSINE, PAIMON_VINDEX_METRIC_INNER_PRODUCT};
     const float candidates[] = {-1.0f, -0.5f, -0.0f, 0.0f, 0.25f, 0.5f, 1.0f, 4.0f};
     for (size_t metric_index = 0; metric_index < 3; ++metric_index) {
         uint32_t metric = metrics[metric_index];
-        PaimonVindexDistanceBand band;
+        PaimonVindexRawDistanceBand band;
         ASSERT_TRUE(paimon_vindex_distance_band_from_endpoints(metric, NULL, NULL, &band) == 0);
         ASSERT_TRUE(band.metric == metric);
-        ASSERT_TRUE(band.lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED);
-        ASSERT_TRUE(band.upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED);
+        ASSERT_TRUE(band.raw_lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED);
+        ASSERT_TRUE(band.raw_upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED);
         for (uint32_t lower_op = PAIMON_VINDEX_CUT_GE; lower_op <= PAIMON_VINDEX_CUT_GT; ++lower_op) {
             for (uint32_t upper_op = PAIMON_VINDEX_CUT_LE; upper_op <= PAIMON_VINDEX_CUT_LT; ++upper_op) {
                 PaimonVindexDistanceEndpoint lower = {0.5, lower_op};
                 PaimonVindexDistanceEndpoint upper = {1.0, upper_op};
                 ASSERT_TRUE(paimon_vindex_distance_band_from_endpoints(metric, &lower, &upper, &band) == 0);
                 for (size_t candidate = 0; candidate < sizeof(candidates) / sizeof(candidates[0]); ++candidate) {
-                    float distance = candidates[candidate];
-                    if (metric == PAIMON_VINDEX_METRIC_L2 && distance < 0) continue;
-                    double value = metric == PAIMON_VINDEX_METRIC_L2 ? (double)sqrtf(distance)
-                        : metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT ? -(double)distance : (double)distance;
+                    float raw_distance = candidates[candidate];
+                    if (metric == PAIMON_VINDEX_METRIC_L2 && raw_distance < 0) continue;
+                    double value = metric == PAIMON_VINDEX_METRIC_L2 ? (double)sqrtf(raw_distance)
+                        : metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT ? -(double)raw_distance : (double)raw_distance;
                     int expected = (lower_op == PAIMON_VINDEX_CUT_GE ? value >= 0.5 : value > 0.5) &&
                         (upper_op == PAIMON_VINDEX_CUT_LE ? value <= 1.0 : value < 1.0);
                     ASSERT_TRUE(expected ==
-                        ((band.lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || distance >= band.lower) &&
-                         (band.upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || distance < band.upper)));
+                        ((band.raw_lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || raw_distance >= band.raw_lower) &&
+                         (band.raw_upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || raw_distance < band.raw_upper)));
                 }
             }
         }
         PaimonVindexDistanceEndpoint precise = {nextafter(1.0, 2.0), PAIMON_VINDEX_CUT_GE};
         ASSERT_TRUE(paimon_vindex_distance_band_from_endpoints(metric, &precise, NULL, &band) == 0);
-        float boundary = metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT ? -1.0f : 1.0f;
-        ASSERT_TRUE(!((band.lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || boundary >= band.lower) &&
-                      (band.upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || boundary < band.upper)));
+        float raw_boundary = metric == PAIMON_VINDEX_METRIC_INNER_PRODUCT ? -1.0f : 1.0f;
+        ASSERT_TRUE(!((band.raw_lower_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || raw_boundary >= band.raw_lower) &&
+                      (band.raw_upper_kind == PAIMON_VINDEX_BOUND_UNBOUNDED || raw_boundary < band.raw_upper)));
     }
-    PaimonVindexDistanceBand band;
+    PaimonVindexRawDistanceBand band;
     PaimonVindexDistanceEndpoint endpoint = {1.0, PAIMON_VINDEX_CUT_LT};
     ASSERT_TRUE(paimon_vindex_distance_band_from_endpoints(PAIMON_VINDEX_METRIC_L2, &endpoint, NULL, &band) != 0);
     endpoint.op = PAIMON_VINDEX_CUT_GE;
@@ -694,19 +764,19 @@ static void test_range_errors(PaimonVindexReaderHandle *reader, const float *que
     invalid.band.metric = UINT32_MAX;
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
     invalid = params;
-    invalid.band.lower_kind = UINT32_MAX;
+    invalid.band.raw_lower_kind = UINT32_MAX;
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
     invalid = params;
-    invalid.band.upper_kind = PAIMON_VINDEX_BOUND_FINITE;
-    invalid.band.upper = NAN;
+    invalid.band.raw_upper_kind = PAIMON_VINDEX_BOUND_FINITE;
+    invalid.band.raw_upper = NAN;
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
-    invalid.band.upper = INFINITY;
+    invalid.band.raw_upper = INFINITY;
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
-    invalid.band.upper = 0;
-    invalid.band.lower_kind = PAIMON_VINDEX_BOUND_FINITE;
-    invalid.band.lower = 1;
+    invalid.band.raw_upper = 0;
+    invalid.band.raw_lower_kind = PAIMON_VINDEX_BOUND_FINITE;
+    invalid.band.raw_lower = 1;
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
-    invalid.band.lower = 0;
+    invalid.band.raw_lower = 0;
     invalid.nprobe = 0;
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
     float bad_query[RANGE_DIMENSION];
@@ -789,17 +859,17 @@ static void test_range_matrix(void) {
             ASSERT_TRUE(filtered_view.hit_count == 0 && filtered_view.lims[1] == 0);
             paimon_vindex_range_search_result_destroy(filtered);
             PaimonVindexRangeSearchParams bounded = params;
-            float minimum = single_view.distances[0];
+            float minimum = single_view.raw_distances[0];
             float maximum = minimum;
             for (size_t hit = 1; hit < single_view.hit_count; ++hit) {
-                minimum = fminf(minimum, single_view.distances[hit]);
-                maximum = fmaxf(maximum, single_view.distances[hit]);
+                minimum = fminf(minimum, single_view.raw_distances[hit]);
+                maximum = fmaxf(maximum, single_view.raw_distances[hit]);
             }
-            bounded.band.lower_kind = PAIMON_VINDEX_BOUND_FINITE;
-            bounded.band.lower = metric_codes[metric] == PAIMON_VINDEX_METRIC_L2
+            bounded.band.raw_lower_kind = PAIMON_VINDEX_BOUND_FINITE;
+            bounded.band.raw_lower = metric_codes[metric] == PAIMON_VINDEX_METRIC_L2
                 ? fmaxf(0, minimum) : minimum;
-            bounded.band.upper_kind = PAIMON_VINDEX_BOUND_FINITE;
-            bounded.band.upper = minimum + (maximum - minimum) / 2;
+            bounded.band.raw_upper_kind = PAIMON_VINDEX_BOUND_FINITE;
+            bounded.band.raw_upper = minimum + (maximum - minimum) / 2;
             PaimonVindexRangeSearchResult *subset = NULL;
             ASSERT_TRUE(paimon_vindex_reader_range_search_batch(
                 reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, bounded, &subset) == 0);
@@ -809,7 +879,8 @@ static void test_range_matrix(void) {
             for (size_t query = 0; query < RANGE_QUERY_COUNT; ++query) {
                 size_t expected = 0;
                 for (size_t hit = batch_view.lims[query]; hit < batch_view.lims[query + 1]; ++hit) {
-                    if (batch_view.distances[hit] >= bounded.band.lower && batch_view.distances[hit] < bounded.band.upper) {
+                    if (batch_view.raw_distances[hit] >= bounded.band.raw_lower &&
+                        batch_view.raw_distances[hit] < bounded.band.raw_upper) {
                         ++expected;
                         int found = 0;
                         for (size_t candidate = subset_view.lims[query]; candidate < subset_view.lims[query + 1]; ++candidate) {
@@ -821,7 +892,7 @@ static void test_range_matrix(void) {
                 ASSERT_TRUE(subset_view.lims[query + 1] - subset_view.lims[query] == expected);
             }
             paimon_vindex_range_search_result_destroy(subset);
-            bounded.band.lower = bounded.band.upper;
+            bounded.band.raw_lower = bounded.band.raw_upper;
             ASSERT_TRUE(paimon_vindex_reader_range_search_batch(
                 reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, bounded, &subset) == 0);
             subset_view = range_view(subset);
@@ -834,7 +905,7 @@ static void test_range_matrix(void) {
             free(buffer.data);
             PaimonVindexRangeSearchResultView retained_view = range_view(single);
             ASSERT_TRUE(retained_view.labels == single_view.labels);
-            ASSERT_TRUE(retained_view.distances == single_view.distances);
+            ASSERT_TRUE(retained_view.raw_distances == single_view.raw_distances);
             range_assert_shape(&retained_view);
             range_assert_shape(&batch_view);
             paimon_vindex_range_search_result_destroy(single);
@@ -851,6 +922,7 @@ int main(void) {
     test_output_flush_callback_error_propagates();
     test_input_read_ranges_callback_error_propagates();
     test_range_endpoints();
+    test_range_endpoint_raw_results();
     test_range_matrix();
     range_fixture_run_all(consume_range_fixture);
     return 0;

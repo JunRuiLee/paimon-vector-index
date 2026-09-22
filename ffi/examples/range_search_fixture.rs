@@ -158,7 +158,8 @@ fn write_case(
 ) -> io::Result<()> {
     let mut reader = VectorIndexReader::open(Cursor::new(index.to_vec()))?;
     assert!(reader.supports_range_search());
-    let params = VectorRangeSearchParams::new(DistanceBand::new(lower, upper, metric)?, NPROBE);
+    let params =
+        VectorRangeSearchParams::new(DistanceBand::from_raw(lower, upper, metric)?, NPROBE);
     let result = match (query_count == 1, filter) {
         (true, None) => reader.range_search(queries, params),
         (true, Some(filter)) => reader.range_search_with_roaring_filter(queries, params, filter),
@@ -188,7 +189,7 @@ fn write_case(
     for label in result.labels() {
         writeln!(file, "{label}")?;
     }
-    for distance in result.distances() {
+    for distance in result.raw_distances() {
         writeln!(file, "{}", distance.to_bits())?;
     }
     for query in 0..query_count {

@@ -20,8 +20,8 @@ package org.apache.paimon.index.vector;
 import java.util.Objects;
 
 /**
- * A half-open band [lower, upper) in raw index distance space: squared L2, 1 - cosine, or negative
- * inner product. A null cut is structurally unbounded, not a finite sentinel.
+ * A half-open band [rawLower, rawUpper) in raw index distance space: squared L2, 1 - cosine, or
+ * negative inner product. A null cut is structurally unbounded, not a finite sentinel.
  */
 public final class VectorDistanceBand {
 
@@ -39,21 +39,26 @@ public final class VectorDistanceBand {
     }
 
     private final String metric;
-    private final Float lower;
-    private final Float upper;
+    private final Float rawLower;
+    private final Float rawUpper;
 
-    public VectorDistanceBand(String metric, Float lower, Float upper) {
+    private VectorDistanceBand(String metric, Float rawLower, Float rawUpper) {
         this.metric = Objects.requireNonNull(metric, "metric");
         if (!"l2".equals(metric) && !"cosine".equals(metric) && !"inner_product".equals(metric)) {
             throw new IllegalArgumentException("unknown metric: " + metric);
         }
-        validateCut(lower);
-        validateCut(upper);
-        if (lower != null && upper != null && lower > upper) {
+        validateRawCut(rawLower);
+        validateRawCut(rawUpper);
+        if (rawLower != null && rawUpper != null && rawLower > rawUpper) {
             throw new IllegalArgumentException("inverted distance band");
         }
-        this.lower = lower;
-        this.upper = upper;
+        this.rawLower = rawLower;
+        this.rawUpper = rawUpper;
+    }
+
+    /** Creates raw half-open cuts without converting endpoint distances or similarities. */
+    public static VectorDistanceBand fromRaw(String metric, Float rawLower, Float rawUpper) {
+        return new VectorDistanceBand(metric, rawLower, rawUpper);
     }
 
     /**
@@ -87,16 +92,16 @@ public final class VectorDistanceBand {
         return metric;
     }
 
-    public Float lower() {
-        return lower;
+    public Float rawLower() {
+        return rawLower;
     }
 
-    public Float upper() {
-        return upper;
+    public Float rawUpper() {
+        return rawUpper;
     }
 
-    private void validateCut(Float cut) {
-        if (cut != null && (!Float.isFinite(cut) || ("l2".equals(metric) && cut < 0))) {
+    private void validateRawCut(Float rawCut) {
+        if (rawCut != null && (!Float.isFinite(rawCut) || ("l2".equals(metric) && rawCut < 0))) {
             throw new IllegalArgumentException(
                     "cut must be finite and non-negative for squared L2");
         }
